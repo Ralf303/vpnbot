@@ -23,8 +23,7 @@ services:
         condition: service_healthy
     volumes:
       - ./secrets/new_vpn_ssh_key:/run/secrets/new_vpn_ssh_key:ro
-      # Раскомментировать только при подключении старого VPS.
-      # - ./secrets/old_vpn_ssh_key:/run/secrets/old_vpn_ssh_key:ro
+      - ./secrets/old_vpn_ssh_key:/run/secrets/old_vpn_ssh_key:ro
     init: true
 
 volumes:

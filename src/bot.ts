@@ -223,8 +223,6 @@ export function createBot(
   bot.callbackQuery(/^dl\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
-    if (config.isLegacy)
-      return showAlert(ctx, "Для старого конфига требуется перенос.");
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Срок действия конфига истёк.");
 
@@ -253,57 +251,16 @@ export function createBot(
 
   bot.callbackQuery(/^lm\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
-    if (!config || !config.isLegacy)
-      return showAlert(ctx, "Конфиг не найден или уже перенесён.");
-    await ctx.answerCallbackQuery();
-    await edit(
-      ctx,
-      "Этот конфиг хранится на старом сервере. Чтобы получить файл повторно, его необходимо перенести. Старый файл перестанет подключаться, вместо него будет создан новый с тем же сроком действия.",
-      new InlineKeyboard()
-        .text("🔄 Перенести и получить", `lmc|${config.id}`)
-        .row()
-        .text("❌ Отмена", `uc|${config.id}`)
-    );
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery({ text: "Перенос больше не требуется." });
+    await showUserConfig(ctx, config, appConfig, trafficService);
   });
 
   bot.callbackQuery(/^lmc\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
-    if (!config || !config.isLegacy)
-      return showAlert(ctx, "Конфиг не найден или уже перенесён.");
-    if (operationLocks.has(config.id))
-      return showAlert(ctx, "Перенос уже выполняется.");
-    operationLocks.add(config.id);
-    await ctx.answerCallbackQuery({ text: "Выполняю перенос…" });
-    try {
-      const migrated = await configService.migrateLegacy(config);
-      await edit(
-        ctx,
-        "✅ Конфиг перенесён на новый сервер. Старый файл отозван и больше не подключится.",
-        new InlineKeyboard()
-          .text("🔎 Открыть конфиг", `uc|${config.id}`)
-          .row()
-          .text("🏠 Главное меню", "m")
-      );
-      await ctx.replyWithDocument(
-        new InputFile(migrated.file, vpnFileName(migrated.clientName)),
-        {
-          caption: `Новый файл «${config.displayName}». Срок действия сохранён: до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
-        }
-      );
-    } catch (error) {
-      logError(error);
-      await ctx.reply(
-        "Перенос не выполнен. Старый конфиг оставлен без изменений. Обратитесь к администратору.",
-        {
-          reply_markup: new InlineKeyboard().url(
-            "Связаться с администратором",
-            appConfig.contactUrl
-          ),
-        }
-      );
-    } finally {
-      operationLocks.delete(config.id);
-    }
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery({ text: "Конфиг остаётся на текущем сервере." });
+    await showUserConfig(ctx, config, appConfig, trafficService);
   });
 
   bot.callbackQuery("a", async (ctx) => {
@@ -532,8 +489,6 @@ async function showUserConfig(
     .row();
   if (expired) {
     keyboard.url("💳 Продлить", appConfig.contactUrl).row();
-  } else if (config.isLegacy) {
-    keyboard.text("📥 Получить файл", `lm|${config.id}`).row();
   } else {
     keyboard.text("📥 Получить файл", `dl|${config.id}`).row();
   }
@@ -728,7 +683,7 @@ async function applyDateTarget(
       );
       await respond(
         ctx,
-        `Конфиг «${config.displayName}» выдан пользователю ${userLabel(user)}.`,
+        `Конфиг «${config.displayName}» выдан пользователю ${userLabel(user)}. Сервер: ${config.serverKey === "old" ? "старый" : "новый"}.`,
         new InlineKeyboard()
           .text("🔎 Открыть конфиг", `ac|${config.id}`)
           .row()

@@ -25,6 +25,7 @@ validate_installation() {
 validate_client() {
   local client="${1:-}"
   [[ "$client" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "Некорректное имя клиента"
+  [[ "$client" != "server" ]] || die "Служебный сертификат недоступен"
 }
 
 is_valid_client() {
@@ -96,7 +97,7 @@ case "$command" in
     refresh_crl
     ;;
   list)
-    tail -n +2 "$PKI_DIR/index.txt" | awk -F= '$1 ~ /^V/ { print $NF }'
+    awk -F= '$1 ~ /^V/ && $NF != "server" { print $NF }' "$PKI_DIR/index.txt"
     ;;
   stats)
     upload=0

@@ -5,10 +5,24 @@ import { createCleanDatabase } from "./database-fixture.js";
 
 class FakeVpn implements VpnOperations {
   readonly calls: string[] = [];
+  readonly clients = { new: [] as string[], old: [] as string[] };
+  readonly configured = { new: true, old: true };
+  readonly listFailures = new Set<"new" | "old">();
   failOldRevoke = false;
+
+  isConfigured(server: "new" | "old"): boolean {
+    return this.configured[server];
+  }
+
+  async listClients(server: "new" | "old"): Promise<string[]> {
+    this.calls.push(`list:${server}`);
+    if (this.listFailures.has(server)) throw new Error(`${server} unavailable`);
+    return [...this.clients[server]];
+  }
 
   async createClient(server: "new" | "old", client: string): Promise<Buffer> {
     this.calls.push(`create:${server}:${client}`);
+    this.clients[server].push(client);
     return Buffer.from("client\ndev tun\n");
   }
 
@@ -38,13 +52,30 @@ afterEach(async () => {
 });
 
 describe("ConfigService", () => {
-  it("создаёт новый клиент только на новом сервере", async () => {
+  it("при равной нагрузке создаёт новый клиент на новом сервере", async () => {
     const user = await db.upsertUser({ telegramId: "100", firstName: "Иван" });
     const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
     expect(config.serverKey).toBe("new");
     expect(config.clientName).toMatch(/^[a-z]{12}$/);
-    expect(vpn.calls[0]).toBe(`create:new:${config.clientName}`);
+    expect(vpn.calls).toContain(`create:new:${config.clientName}`);
     expect(await db.listVisibleConfigs(user.id)).toHaveLength(1);
+  });
+
+  it("выбирает сервер с меньшим количеством действующих клиентов", async () => {
+    vpn.clients.new.push("new_one", "new_two");
+    const user = await db.upsertUser({ telegramId: "102", firstName: "Пётр" });
+    const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
+
+    expect(config.serverKey).toBe("old");
+    expect(vpn.calls).toContain(`create:old:${config.clientName}`);
+  });
+
+  it("использует доступный сервер, если второй не отвечает", async () => {
+    vpn.listFailures.add("old");
+    const user = await db.upsertUser({ telegramId: "103", firstName: "Ольга" });
+    const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
+
+    expect(config.serverKey).toBe("new");
   });
 
   it("выдаёт разные технические имена и не меняет их при переименовании", async () => {
@@ -74,5 +105,15 @@ describe("ConfigService", () => {
     expect(restored.serverKey).toBe("old");
     expect(restored.clientName).toBe("legacy_one");
     expect(vpn.calls.some((call) => call.startsWith("revoke:new:"))).toBe(true);
+  });
+
+  it("повторно выдаёт старый конфиг без переноса", async () => {
+    const user = await db.upsertUser({ telegramId: "104", firstName: "Мария" });
+    await db.syncLegacyClients("old", ["legacy_download"]);
+    const legacy = (await db.listUnassignedLegacyClients("old"))[0]!;
+    const config = await service.bindLegacy(user, legacy, "2027-01-01T20:59:59.999Z");
+
+    await expect(service.download(config)).resolves.toBeInstanceOf(Buffer);
+    expect(vpn.calls.at(-1)).toBe("download:old:legacy_download");
   });
 });

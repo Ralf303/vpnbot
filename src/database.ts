@@ -204,13 +204,19 @@ export class AppDatabase {
     });
   }
 
-  async replaceClient(id: string, clientName: string, expiresAt: string, hiddenAt: string): Promise<void> {
+  async replaceClient(
+    id: string,
+    clientName: string,
+    serverKey: ServerKey,
+    expiresAt: string,
+    hiddenAt: string
+  ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.vpnConfig.update({
         where: { id },
         data: {
           clientName,
-          serverKey: "new",
+          serverKey,
           isLegacy: false,
           expiresAt: new Date(expiresAt),
           hiddenAt: new Date(hiddenAt),

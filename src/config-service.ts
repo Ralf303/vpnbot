@@ -2,12 +2,15 @@ import { randomInt, randomUUID } from "node:crypto";
 import { AppDatabase } from "./database.js";
 import type {
   LegacyClientRecord,
+  ServerKey,
   UserRecord,
   VpnConfigRecord,
 } from "./domain.js";
 import { hiddenAtFromExpiry, isExpired } from "./time.js";
 
 export interface VpnOperations {
+  isConfigured(serverKey: ServerKey): boolean;
+  listClients(serverKey: ServerKey): Promise<string[]>;
   createClient(serverKey: "new" | "old", clientName: string): Promise<Buffer>;
   downloadClient(serverKey: "new" | "old", clientName: string): Promise<Buffer>;
   revokeClient(serverKey: "new" | "old", clientName: string): Promise<void>;
@@ -30,14 +33,15 @@ export class ConfigService {
   ) {}
 
   async issue(user: UserRecord, expiresAt: string): Promise<VpnConfigRecord> {
-    const { clientName } = await this.createUniqueClient();
+    const serverKey = await this.selectIssueServer();
+    const { clientName } = await this.createUniqueClient(serverKey);
     const now = new Date().toISOString();
     const record: VpnConfigRecord = {
       id: randomUUID(),
       userId: user.id,
       displayName: `VPN #${await this.db.nextConfigNumber(user.id)}`,
       clientName,
-      serverKey: "new",
+      serverKey,
       expiresAt,
       status: "active",
       isLegacy: false,
@@ -52,7 +56,7 @@ export class ConfigService {
       return record;
     } catch (error) {
       await this.vpn
-        .revokeClient("new", clientName)
+        .revokeClient(serverKey, clientName)
         .catch((rollbackError: unknown) => {
           console.error(
             "Не удалось отозвать клиент после ошибки БД",
@@ -92,8 +96,6 @@ export class ConfigService {
     if (config.status !== "active" || isExpired(config.expiresAt)) {
       throw new Error("Срок действия конфига истёк");
     }
-    if (config.isLegacy)
-      throw new Error("Старый конфиг необходимо сначала перенести");
     return this.vpn.downloadClient(config.serverKey, config.clientName);
   }
 
@@ -106,11 +108,12 @@ export class ConfigService {
     if (config.status !== "active" || isExpired(config.expiresAt))
       throw new Error("Сначала продлите срок действия конфига");
 
-    const { clientName: newClientName, file } = await this.createUniqueClient();
+    const { clientName: newClientName, file } = await this.createUniqueClient("new");
     try {
       await this.db.replaceClient(
         config.id,
         newClientName,
+        "new",
         config.expiresAt,
         config.hiddenAt
       );
@@ -154,12 +157,21 @@ export class ConfigService {
   ): Promise<VpnConfigRecord> {
     const hiddenAt = hiddenAtFromExpiry(expiresAt);
     if (config.status === "expired" || config.revokedAt) {
-      const { clientName: newClientName } = await this.createUniqueClient();
+      const serverKey = this.vpn.isConfigured(config.serverKey)
+        ? config.serverKey
+        : await this.selectIssueServer();
+      const { clientName: newClientName } = await this.createUniqueClient(serverKey);
       try {
-        await this.db.replaceClient(config.id, newClientName, expiresAt, hiddenAt);
+        await this.db.replaceClient(
+          config.id,
+          newClientName,
+          serverKey,
+          expiresAt,
+          hiddenAt
+        );
       } catch (error) {
         await this.vpn
-          .revokeClient("new", newClientName)
+          .revokeClient(serverKey, newClientName)
           .catch((rollbackError: unknown) => {
             console.error(
               "Не удалось отозвать новый клиент после ошибки продления",
@@ -181,16 +193,45 @@ export class ConfigService {
     await this.db.markRevoked(config.id);
   }
 
-  private async createUniqueClient(): Promise<{
+  private async createUniqueClient(serverKey: ServerKey): Promise<{
     clientName: string;
     file: Buffer;
   }> {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const clientName = randomClientName();
       if (!(await this.db.reserveClientName(clientName))) continue;
-      const file = await this.vpn.createClient("new", clientName);
+      const file = await this.vpn.createClient(serverKey, clientName);
       return { clientName, file };
     }
     throw new Error("Не удалось сгенерировать уникальное имя VPN-конфига");
+  }
+
+  private async selectIssueServer(): Promise<ServerKey> {
+    const available = (
+      await Promise.all(
+        (["new", "old"] as const).map(async (serverKey) => {
+          if (!this.vpn.isConfigured(serverKey)) return null;
+          try {
+            return {
+              serverKey,
+              clients: (await this.vpn.listClients(serverKey)).length,
+            };
+          } catch (error) {
+            console.error(`VPN-сервер ${serverKey} недоступен для выдачи`, error);
+            return null;
+          }
+        })
+      )
+    ).filter((item): item is { serverKey: ServerKey; clients: number } => Boolean(item));
+
+    if (available.length === 0) {
+      throw new Error("Нет доступных VPN-серверов для выдачи конфига");
+    }
+    available.sort(
+      (left, right) =>
+        left.clients - right.clients ||
+        (left.serverKey === "new" ? -1 : 1)
+    );
+    return available[0]!.serverKey;
   }
 }
