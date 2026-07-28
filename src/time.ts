@@ -17,6 +17,14 @@ export function dateAfterDays(days: number, timezone: string, now = DateTime.now
   return now.setZone(timezone).plus({ days }).toFormat("yyyy-MM-dd");
 }
 
+export function dateAfterMonths(months: number, timezone: string, now = DateTime.now()): string {
+  return now.setZone(timezone).plus({ months }).toFormat("yyyy-MM-dd");
+}
+
+export function dateAfterYears(years: number, timezone: string, now = DateTime.now()): string {
+  return now.setZone(timezone).plus({ years }).toFormat("yyyy-MM-dd");
+}
+
 export function daysUntilExpiry(expiresAt: string, timezone: string, now = DateTime.now()): number {
   const today = now.setZone(timezone).startOf("day");
   const expiryDay = DateTime.fromISO(expiresAt, { zone: "utc" }).setZone(timezone).startOf("day");

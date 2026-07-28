@@ -13,6 +13,8 @@ import { vpnFileName } from "./file-name.js";
 import { TrafficService, type ServerTrafficUsage } from "./traffic-service.js";
 import {
   dateAfterDays,
+  dateAfterMonths,
+  dateAfterYears,
   expiryFromDate,
   formatDate,
   isExpired,
@@ -372,14 +374,17 @@ export function createBot(
     );
   });
 
-  bot.callbackQuery(/^dt\|([ibe])\|([^|]+)\|(30|60|90)$/, async (ctx) => {
+  bot.callbackQuery(/^dt\|([ibe])\|([^|]+)\|(30|60|90|6m|1y)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const target = decodeDateTarget(ctx.match[1]!, ctx.match[2]!);
     if (!target) return showAlert(ctx, "Действие устарело.");
-    const expiresAt = expiryFromDate(
-      dateAfterDays(Number(ctx.match[3]), appConfig.timezone),
-      appConfig.timezone
-    )!;
+    const period = ctx.match[3]!;
+    const date = period === "6m"
+      ? dateAfterMonths(6, appConfig.timezone)
+      : period === "1y"
+        ? dateAfterYears(1, appConfig.timezone)
+        : dateAfterDays(Number(period), appConfig.timezone);
+    const expiresAt = expiryFromDate(date, appConfig.timezone)!;
     await ctx.answerCallbackQuery({ text: "Выполняю…" });
     await applyDateTarget(ctx, target, expiresAt, appConfig, db, configService);
   });
@@ -662,6 +667,9 @@ async function showDateMenu(
       .text("+30 дней", `dt|${code}|${value}|30`)
       .text("+60 дней", `dt|${code}|${value}|60`)
       .text("+90 дней", `dt|${code}|${value}|90`)
+      .row()
+      .text("+6 месяцев", `dt|${code}|${value}|6m`)
+      .text("+1 год", `dt|${code}|${value}|1y`)
       .row()
       .text("📅 Указать дату", `dc|${code}|${value}`)
       .row()

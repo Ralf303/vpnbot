@@ -1,8 +1,21 @@
 import { DateTime } from "luxon";
 import { describe, expect, it } from "vitest";
-import { daysUntilExpiry, expiryFromDate, hiddenAtFromExpiry, isRevocationDue } from "../src/time.js";
+import {
+  dateAfterMonths,
+  dateAfterYears,
+  daysUntilExpiry,
+  expiryFromDate,
+  hiddenAtFromExpiry,
+  isRevocationDue,
+} from "../src/time.js";
 
 describe("правила срока действия", () => {
+  it("считает полгода и год как календарные периоды", () => {
+    const now = DateTime.fromISO("2026-01-31T12:00:00", { zone: "Europe/Moscow" });
+    expect(dateAfterMonths(6, "Europe/Moscow", now)).toBe("2026-07-31");
+    expect(dateAfterYears(1, "Europe/Moscow", now)).toBe("2027-01-31");
+  });
+
   it("считает выбранную дату до конца дня по Москве", () => {
     expect(expiryFromDate("2026-07-28", "Europe/Moscow"))
       .toBe("2026-07-28T20:59:59.999Z");
