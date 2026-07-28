@@ -73,7 +73,7 @@ case "$command" in
     client="$2"
     [[ ! -e "$PKI_DIR/issued/$client.crt" ]] || die "Клиент уже существует"
     cd "$EASYRSA_DIR"
-    ./easyrsa --batch --days=3650 build-client-full "$client" nopass >/dev/null
+    ./easyrsa --batch --days=3650 build-client-full "$client" nopass >/dev/null 2>&1
     render_client "$client"
     ;;
   download)
@@ -88,8 +88,8 @@ case "$command" in
     fi
     is_valid_client "$client" || die "Активный клиент не найден"
     cd "$EASYRSA_DIR"
-    ./easyrsa --batch revoke "$client" >/dev/null
-    ./easyrsa --batch --days=3650 gen-crl >/dev/null
+    ./easyrsa --batch revoke "$client" >/dev/null 2>&1
+    ./easyrsa --batch --days=3650 gen-crl >/dev/null 2>&1
     rm -f "$PKI_DIR/reqs/$client.req" "$PKI_DIR/private/$client.key"
     refresh_crl
     ;;
