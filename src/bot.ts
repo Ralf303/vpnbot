@@ -370,13 +370,24 @@ export function createBot(
       const names = await vpn.listClients("old");
       await db.syncLegacyClients("old", names);
       const clients = await db.listUnassignedLegacyClients("old");
-      await showLegacyClients(ctx, user.id, clients);
+      await showLegacyClients(ctx, user.id, clients, 0);
     } catch (error) {
       logError(error);
       await ctx.reply("Не удалось прочитать список клиентов старого сервера.", {
         reply_markup: new InlineKeyboard().text("Назад", `au|${user.id}`),
       });
     }
+  });
+
+  bot.callbackQuery(/^abp\|(\d+)\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const userId = Number(ctx.match[1]);
+    const page = Number(ctx.match[2]);
+    const user = await db.getUserById(userId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery();
+    const clients = await db.listUnassignedLegacyClients("old");
+    await showLegacyClients(ctx, userId, clients, page);
   });
 
   bot.callbackQuery(/^abl\|(\d+)\|(\d+)$/, async (ctx) => {
@@ -635,16 +646,28 @@ async function showDateMenu(
 async function showLegacyClients(
   ctx: Context,
   userId: number,
-  clients: LegacyClientRecord[]
+  clients: LegacyClientRecord[],
+  requestedPage: number
 ): Promise<void> {
+  const pageSize = 10;
+  const totalPages = Math.max(1, Math.ceil(clients.length / pageSize));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const pageClients = clients.slice(page * pageSize, (page + 1) * pageSize);
   const keyboard = new InlineKeyboard();
-  for (const client of clients.slice(0, 40))
+  for (const client of pageClients)
     keyboard.text(client.clientName, `abl|${userId}|${client.id}`).row();
+  if (totalPages > 1) {
+    if (page > 0) keyboard.text("⬅️", `abp|${userId}|${page - 1}`);
+    keyboard.text(`${page + 1}/${totalPages}`, `abp|${userId}|${page}`);
+    if (page < totalPages - 1)
+      keyboard.text("➡️", `abp|${userId}|${page + 1}`);
+    keyboard.row();
+  }
   keyboard.text("Назад", `au|${userId}`);
   await edit(
     ctx,
     clients.length
-      ? "Выберите существующий OpenVPN-клиент:"
+      ? `Выберите существующий OpenVPN-клиент:\n\nСтраница ${page + 1} из ${totalPages} · доступно: ${clients.length}`
       : "Непривязанных клиентов на старом сервере нет.",
     keyboard
   );
