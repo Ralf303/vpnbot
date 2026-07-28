@@ -37,3 +37,22 @@ export interface ServerTraffic {
   uploadBytes: number;
   downloadBytes: number;
 }
+
+export interface ActiveTrafficSession extends ServerTraffic {
+  clientName: string;
+  connectedAt: number;
+}
+
+export interface CompletedTrafficSession extends ActiveTrafficSession {
+  eventId: string;
+  disconnectedAt: number;
+}
+
+export interface TrafficSnapshot {
+  active: ActiveTrafficSession[];
+  completed: CompletedTrafficSession[];
+}
+
+export interface TrafficUsage extends ServerTraffic {
+  totalBytes: number;
+}

@@ -5,13 +5,15 @@ import { AppDatabase } from "./database.js";
 import { createBot } from "./bot.js";
 import { BackgroundJobs } from "./jobs.js";
 import { OpenVpnGateway } from "./openvpn.js";
+import { TrafficService } from "./traffic-service.js";
 
 const config = loadConfig();
 const db = new AppDatabase(config.databaseUrl);
 const vpn = new OpenVpnGateway(config.servers);
 const configService = new ConfigService(db, vpn);
-const { bot } = createBot(config, db, vpn, configService);
-const jobs = new BackgroundJobs(bot, db, vpn, config);
+const trafficService = new TrafficService(db, vpn);
+const { bot } = createBot(config, db, vpn, configService, trafficService);
+const jobs = new BackgroundJobs(bot, db, vpn, config, trafficService);
 
 let stopping = false;
 async function shutdown(signal: string): Promise<void> {

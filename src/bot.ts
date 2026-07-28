@@ -10,6 +10,7 @@ import type {
 } from "./domain.js";
 import { OpenVpnGateway } from "./openvpn.js";
 import { vpnFileName } from "./file-name.js";
+import { TrafficService, type ServerTrafficUsage } from "./traffic-service.js";
 import {
   dateAfterDays,
   expiryFromDate,
@@ -38,7 +39,8 @@ export function createBot(
   appConfig: AppConfig,
   db: AppDatabase,
   vpn: OpenVpnGateway,
-  configService: ConfigService
+  configService: ConfigService,
+  trafficService: TrafficService
 ): BotApplication {
   const bot = new Bot(appConfig.botToken);
 
@@ -198,7 +200,7 @@ export function createBot(
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     await ctx.answerCallbackQuery();
-    await showUserConfig(ctx, config, appConfig);
+    await showUserConfig(ctx, config, appConfig, trafficService);
   });
 
   bot.callbackQuery(/^rn\|(.+)$/, async (ctx) => {
@@ -306,7 +308,13 @@ export function createBot(
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     pendingInputs.delete(String(ctx.from.id));
     await ctx.answerCallbackQuery();
-    await showAdminMain(ctx, db, vpn);
+    await showAdminMain(ctx, db);
+  });
+
+  bot.callbackQuery("at", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    await ctx.answerCallbackQuery({ text: "Обновляю статистику…" });
+    await showTrafficStats(ctx, trafficService, vpn);
   });
 
   bot.callbackQuery("as", async (ctx) => {
@@ -334,7 +342,7 @@ export function createBot(
     if (!config || config.status === "revoked")
       return showAlert(ctx, "Конфиг не найден.");
     await ctx.answerCallbackQuery();
-    await showAdminConfig(ctx, config, db, appConfig);
+    await showAdminConfig(ctx, config, db, appConfig, trafficService);
   });
 
   bot.callbackQuery(/^ai\|(\d+)$/, async (ctx) => {
@@ -508,10 +516,12 @@ function usersKeyboard(users: UserRecord[]): InlineKeyboard {
 async function showUserConfig(
   ctx: Context,
   config: VpnConfigRecord,
-  appConfig: AppConfig
+  appConfig: AppConfig,
+  trafficService: TrafficService
 ): Promise<void> {
   const expired = isExpired(config.expiresAt) || config.status === "expired";
   const status = expired ? "Просрочен" : "Активен";
+  const traffic = await trafficService.forConfig(config);
   const keyboard = new InlineKeyboard()
     .text("✏️ Переименовать", `rn|${config.id}`)
     .row();
@@ -525,28 +535,16 @@ async function showUserConfig(
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");
   await edit(
     ctx,
-    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
+    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}\n📊 Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
     keyboard
   );
 }
 
 async function showAdminMain(
   ctx: Context,
-  db: AppDatabase,
-  vpn: OpenVpnGateway
+  db: AppDatabase
 ): Promise<void> {
   const stats = await db.stats();
-  const trafficLines = await Promise.all(
-    (["new", "old"] as const).map(async (key) => {
-      if (!vpn.isConfigured(key)) return `${vpn.serverName(key)}: не подключён`;
-      try {
-        const traffic = await vpn.traffic(key);
-        return `${vpn.serverName(key)}: ↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)}`;
-      } catch {
-        return `${vpn.serverName(key)}: статистика недоступна`;
-      }
-    })
-  );
 
   const text = [
     "🛠 Админ-панель",
@@ -556,9 +554,6 @@ async function showAdminMain(
     `🔴 Просроченных в меню: ${stats.expired}`,
     `На новом сервере: ${stats.new}`,
     `На старом сервере: ${stats.old}`,
-    "",
-    "📊 VPN-трафик по счётчикам сервера:",
-    ...trafficLines,
   ].join("\n");
   await edit(
     ctx,
@@ -566,7 +561,37 @@ async function showAdminMain(
     new InlineKeyboard()
       .text("🔎 Найти пользователя", "as")
       .row()
+      .text("📊 Статистика", "at")
+      .row()
       .text("🏠 Главное меню", "m")
+  );
+}
+
+async function showTrafficStats(
+  ctx: Context,
+  trafficService: TrafficService,
+  vpn: OpenVpnGateway
+): Promise<void> {
+  const stats = await trafficService.all();
+  const text = [
+    "📊 Статистика трафика",
+    "",
+    "🌐 Всего за всё время",
+    `Всего: ${formatBytes(stats.total.totalBytes)}`,
+    `↑ От пользователей: ${formatBytes(stats.total.uploadBytes)}`,
+    `↓ Пользователям: ${formatBytes(stats.total.downloadBytes)}`,
+    "",
+    ...trafficServerLines(vpn.serverName("new"), stats.servers.new),
+    "",
+    ...trafficServerLines(vpn.serverName("old"), stats.servers.old),
+  ].join("\n");
+  await edit(
+    ctx,
+    text,
+    new InlineKeyboard()
+      .text("🔄 Обновить", "at")
+      .row()
+      .text("⬅️ Админ-панель", "a")
   );
 }
 
@@ -595,10 +620,12 @@ async function showAdminConfig(
   ctx: Context,
   config: VpnConfigRecord,
   db: AppDatabase,
-  appConfig: AppConfig
+  appConfig: AppConfig,
+  trafficService: TrafficService
 ): Promise<void> {
   const user = (await db.getUserById(config.userId))!;
   const expired = isExpired(config.expiresAt) || config.status === "expired";
+  const traffic = await trafficService.forConfig(config);
   const text = [
     `Конфиг: ${config.displayName}`,
     `Пользователь: ${userLabel(user)}`,
@@ -606,6 +633,7 @@ async function showAdminConfig(
     `Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
     `Сервер: ${config.serverKey === "old" ? "старый" : "новый"}`,
     `OpenVPN-клиент: ${config.clientName}`,
+    `Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
   ].join("\n");
   await edit(
     ctx,
@@ -867,6 +895,20 @@ function formatBytes(bytes: number): string {
     if (value < 1024) break;
   }
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${unit}`;
+}
+
+function trafficServerLines(
+  name: string,
+  traffic: ServerTrafficUsage
+): string[] {
+  return [
+    `🖥 ${name}`,
+    `Всего: ${formatBytes(traffic.totalBytes)}`,
+    `↑ ${formatBytes(traffic.uploadBytes)} · ↓ ${formatBytes(traffic.downloadBytes)}`,
+    traffic.liveAvailable
+      ? `Подключений сейчас: ${traffic.activeConnections}`
+      : "Текущие подключения: сервер не подключён",
+  ];
 }
 
 async function edit(

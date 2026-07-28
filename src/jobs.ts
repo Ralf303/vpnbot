@@ -5,17 +5,20 @@ import type { AppConfig } from "./config.js";
 import { AppDatabase } from "./database.js";
 import { OpenVpnGateway } from "./openvpn.js";
 import { daysUntilExpiry, formatDate, isRevocationDue } from "./time.js";
+import { TrafficService } from "./traffic-service.js";
 
 export class BackgroundJobs {
   private readonly tasks: ScheduledTask[] = [];
   private remindersRunning = false;
   private revocationsRunning = false;
+  private trafficRunning = false;
 
   constructor(
     private readonly bot: Bot,
     private readonly db: AppDatabase,
     private readonly vpn: OpenVpnGateway,
-    private readonly config: AppConfig
+    private readonly config: AppConfig,
+    private readonly traffic: TrafficService
   ) {}
 
   start(): void {
@@ -31,8 +34,14 @@ export class BackgroundJobs {
         timezone: this.config.timezone,
       })
     );
+    this.tasks.push(
+      cron.schedule("* * * * *", () => void this.syncTraffic(), {
+        timezone: this.config.timezone,
+      })
+    );
     void this.sendReminders();
     void this.revokeExpired();
+    void this.syncTraffic();
   }
 
   stop(): void {
@@ -97,6 +106,16 @@ export class BackgroundJobs {
       }
     } finally {
       this.revocationsRunning = false;
+    }
+  }
+
+  async syncTraffic(): Promise<void> {
+    if (this.trafficRunning) return;
+    this.trafficRunning = true;
+    try {
+      await this.traffic.syncAll();
+    } finally {
+      this.trafficRunning = false;
     }
   }
 }

@@ -74,13 +74,14 @@ docker compose -f compose.test.yaml down
 
 ## Серверный helper
 
-Интерактивное меню `openvpn-install.sh` не предназначено для автоматизации. Файл `deploy/openvpn-bot-helper` выполняет только пять строго ограниченных операций:
+Интерактивное меню `openvpn-install.sh` не предназначено для автоматизации. Файл `deploy/openvpn-bot-helper` выполняет только шесть строго ограниченных операций:
 
 - `create CLIENT` — создать сертификат и вернуть `.ovpn` в stdout;
 - `download CLIENT` — повторно собрать активный `.ovpn`;
 - `revoke CLIENT` — отозвать сертификат и обновить CRL;
 - `list` — вывести активные имена клиентов;
 - `stats` — вывести суммарный трафик интерфейсов `tun*` с момента их запуска.
+- `traffic-sessions` — вывести активные и завершённые VPN-сессии для накопительного учёта.
 
 Helper использует каталог `/etc/openvpn/server/easy-rsa`, `client-common.txt` и CRL, созданные исходным установщиком.
 
@@ -91,6 +92,22 @@ sudo install -o root -g root -m 0755 deploy/openvpn-bot-helper /usr/local/sbin/o
 sudo install -o root -g root -m 0440 deploy/sudoers-vpn-bot /etc/sudoers.d/vpn-bot
 sudo visudo -cf /etc/sudoers.d/vpn-bot
 ```
+
+Для накопительного учёта трафика установите disconnect-hook и добавьте в `server.conf`:
+
+```bash
+sudo install -o root -g root -m 0755 deploy/openvpn-traffic-disconnect /usr/local/sbin/openvpn-traffic-disconnect
+sudo install -d -o nobody -g nogroup -m 0700 /var/lib/openvpn-bot/traffic-events
+```
+
+```text
+script-security 2
+status /run/openvpn-server/server-status.tsv 10
+status-version 3
+client-disconnect /usr/local/sbin/openvpn-traffic-disconnect
+```
+
+После проверки конфигурации перезапустите OpenVPN. Завершённые сессии сохраняются hook-скриптом, а активные читаются из status-файла. Бот раз в минуту импортирует завершённые сессии в PostgreSQL.
 
 SSH-ключ бота должен быть отдельным от Вашего административного ключа. В `authorized_keys` рекомендуется запретить forwarding и PTY:
 
@@ -161,4 +178,4 @@ sudo cp -a /root/openvpn-install.sh /root/openvpn-install.before-vpnbot.sh
 
 ## Трафик
 
-Админ-панель показывает суммарные RX/TX-счётчики интерфейсов `tun*` отдельно для каждого доступного VPS. Это общий VPN-трафик сервера, а не статистика отдельных пользователей. Счётчики сбрасываются при пересоздании или перезапуске VPN-интерфейса.
+Раздел «Статистика» показывает накопительный трафик отдельно для каждого VPS и общий итог. Карточка конфига показывает его собственный трафик. Завершённые сессии хранятся в PostgreSQL, активные добавляются из OpenVPN status-файла и не удваиваются при последующем импорте завершённой сессии.

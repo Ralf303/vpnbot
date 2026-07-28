@@ -49,6 +49,8 @@ model VpnConfig {
   user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   notifications  Notification[]
   legacyClients  LegacyClient[]
+  clientNames    ClientName[]
+  trafficEvents  TrafficEvent[]
 
   @@unique([serverKey, clientName])
   @@index([userId])
@@ -83,7 +85,28 @@ model LegacyClient {
 
 model ClientName {
   name      String   @id @db.VarChar(64)
+  configId  String?  @db.Uuid @map("config_id")
   createdAt DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+  config    VpnConfig? @relation(fields: [configId], references: [id], onDelete: SetNull)
 
+  @@index([configId])
   @@map("client_names")
+}
+
+model TrafficEvent {
+  serverKey     ServerKey @map("server_key")
+  eventId       String    @db.VarChar(160) @map("event_id")
+  configId      String?   @db.Uuid @map("config_id")
+  clientName    String    @db.VarChar(64) @map("client_name")
+  uploadBytes   BigInt    @map("upload_bytes")
+  downloadBytes BigInt    @map("download_bytes")
+  connectedAt   DateTime  @db.Timestamptz(3) @map("connected_at")
+  disconnectedAt DateTime @db.Timestamptz(3) @map("disconnected_at")
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+  config        VpnConfig? @relation(fields: [configId], references: [id], onDelete: SetNull)
+
+  @@id([serverKey, eventId])
+  @@index([configId])
+  @@index([serverKey, disconnectedAt])
+  @@map("traffic_events")
 }

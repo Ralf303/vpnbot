@@ -1,7 +1,14 @@
 import { PrismaPg } from "@prisma/adapter-pg";
 import type { User, VpnConfig, LegacyClient } from "./generated/prisma/client.js";
 import { PrismaClient } from "./generated/prisma/client.js";
-import type { LegacyClientRecord, ServerKey, UserRecord, VpnConfigRecord } from "./domain.js";
+import type {
+  CompletedTrafficSession,
+  LegacyClientRecord,
+  ServerKey,
+  ServerTraffic,
+  UserRecord,
+  VpnConfigRecord,
+} from "./domain.js";
 
 function mapUser(row: User): UserRecord {
   return {
@@ -112,7 +119,14 @@ export class AppDatabase {
   }
 
   async insertConfig(config: VpnConfigRecord): Promise<void> {
-    await this.prisma.vpnConfig.create({ data: configData(config) });
+    await this.prisma.$transaction(async (tx) => {
+      await tx.vpnConfig.create({ data: configData(config) });
+      await tx.clientName.upsert({
+        where: { name: config.clientName },
+        create: { name: config.clientName, configId: config.id },
+        update: { configId: config.id },
+      });
+    });
   }
 
   async reserveClientName(name: string): Promise<boolean> {
@@ -132,6 +146,11 @@ export class AppDatabase {
       });
       if (!legacy) throw new Error("Этот клиент уже привязан");
       await tx.vpnConfig.create({ data: configData(config) });
+      await tx.clientName.upsert({
+        where: { name: config.clientName },
+        create: { name: config.clientName, configId: config.id },
+        update: { configId: config.id },
+      });
       await tx.legacyClient.update({ where: { id: legacyId }, data: { assignedConfigId: config.id } });
     });
   }
@@ -186,33 +205,114 @@ export class AppDatabase {
   }
 
   async replaceClient(id: string, clientName: string, expiresAt: string, hiddenAt: string): Promise<void> {
-    await this.prisma.vpnConfig.update({
-      where: { id },
-      data: {
-        clientName,
-        serverKey: "new",
-        isLegacy: false,
-        expiresAt: new Date(expiresAt),
-        hiddenAt: new Date(hiddenAt),
-        status: "active",
-        revokedAt: null,
-      },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.vpnConfig.update({
+        where: { id },
+        data: {
+          clientName,
+          serverKey: "new",
+          isLegacy: false,
+          expiresAt: new Date(expiresAt),
+          hiddenAt: new Date(hiddenAt),
+          status: "active",
+          revokedAt: null,
+        },
+      });
+      await tx.clientName.update({ where: { name: clientName }, data: { configId: id } });
     });
   }
 
   async restoreLegacyClient(id: string, clientName: string, expiresAt: string, hiddenAt: string): Promise<void> {
-    await this.prisma.vpnConfig.update({
-      where: { id },
-      data: {
-        clientName,
-        serverKey: "old",
-        isLegacy: true,
-        expiresAt: new Date(expiresAt),
-        hiddenAt: new Date(hiddenAt),
-        status: "active",
-        revokedAt: null,
-      },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.vpnConfig.update({
+        where: { id },
+        data: {
+          clientName,
+          serverKey: "old",
+          isLegacy: true,
+          expiresAt: new Date(expiresAt),
+          hiddenAt: new Date(hiddenAt),
+          status: "active",
+          revokedAt: null,
+        },
+      });
+      await tx.clientName.upsert({
+        where: { name: clientName },
+        create: { name: clientName, configId: id },
+        update: { configId: id },
+      });
     });
+  }
+
+  async importTrafficEvents(
+    serverKey: ServerKey,
+    events: CompletedTrafficSession[]
+  ): Promise<void> {
+    if (events.length === 0) return;
+    await this.prisma.$transaction(async (tx) => {
+      for (const event of events) {
+        const name = await tx.clientName.findUnique({
+          where: { name: event.clientName },
+          select: { configId: true },
+        });
+        await tx.trafficEvent.upsert({
+          where: {
+            serverKey_eventId: { serverKey, eventId: event.eventId },
+          },
+          create: {
+            serverKey,
+            eventId: event.eventId,
+            configId: name?.configId ?? null,
+            clientName: event.clientName,
+            uploadBytes: BigInt(event.uploadBytes),
+            downloadBytes: BigInt(event.downloadBytes),
+            connectedAt: new Date(event.connectedAt * 1000),
+            disconnectedAt: new Date(event.disconnectedAt * 1000),
+          },
+          update: {
+            ...(name?.configId ? { configId: name.configId } : {}),
+          },
+        });
+      }
+    });
+  }
+
+  async trafficForConfig(configId: string): Promise<ServerTraffic> {
+    const totals = await this.prisma.trafficEvent.aggregate({
+      where: { configId },
+      _sum: { uploadBytes: true, downloadBytes: true },
+    });
+    return {
+      uploadBytes: Number(totals._sum.uploadBytes ?? 0n),
+      downloadBytes: Number(totals._sum.downloadBytes ?? 0n),
+    };
+  }
+
+  async clientNamesForConfig(configId: string): Promise<string[]> {
+    return (
+      await this.prisma.clientName.findMany({
+        where: { configId },
+        select: { name: true },
+      })
+    ).map((row) => row.name);
+  }
+
+  async completedTrafficByServer(): Promise<Record<ServerKey, ServerTraffic>> {
+    const rows = await this.prisma.trafficEvent.groupBy({
+      by: ["serverKey"],
+      _sum: { uploadBytes: true, downloadBytes: true },
+    });
+    const result: Record<ServerKey, ServerTraffic> = {
+      new: { uploadBytes: 0, downloadBytes: 0 },
+      old: { uploadBytes: 0, downloadBytes: 0 },
+    };
+    for (const row of rows) {
+      result[row.serverKey] = {
+        uploadBytes: Number(row._sum.uploadBytes ?? 0n),
+        downloadBytes: Number(row._sum.downloadBytes ?? 0n),
+      };
+    }
+    return result;
   }
 
   async markExpired(id: string): Promise<void> {
@@ -250,6 +350,11 @@ export class AppDatabase {
     await this.prisma.$transaction(async (tx) => {
       await tx.legacyClient.deleteMany({ where: { serverKey, assignedConfigId: null } });
       for (const clientName of clientNames) {
+        await tx.clientName.upsert({
+          where: { name: clientName },
+          create: { name: clientName },
+          update: {},
+        });
         await tx.legacyClient.upsert({
           where: { serverKey_clientName: { serverKey, clientName } },
           create: { serverKey, clientName, discoveredAt: now },

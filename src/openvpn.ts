@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { Client } from "ssh2";
-import type { ServerKey, ServerTraffic } from "./domain.js";
+import type {
+  ActiveTrafficSession,
+  CompletedTrafficSession,
+  ServerKey,
+  ServerTraffic,
+  TrafficSnapshot,
+} from "./domain.js";
 import type { VpnServerConfig } from "./config.js";
 
 const CLIENT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
@@ -77,6 +83,50 @@ export class OpenVpnGateway {
     };
   }
 
+  async trafficSessions(serverKey: ServerKey): Promise<TrafficSnapshot> {
+    const output = await this.execute(serverKey, ["traffic-sessions"]);
+    const active: ActiveTrafficSession[] = [];
+    const completed: CompletedTrafficSession[] = [];
+    for (const line of output.toString("utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      const fields = line.split("\t");
+      if (fields[0] === "active" && fields.length === 5) {
+        const [, clientName, connectedAt, uploadBytes, downloadBytes] = fields;
+        if (!clientName || !CLIENT_NAME.test(clientName)) continue;
+        const parsed = parseTrafficNumbers(connectedAt, uploadBytes, downloadBytes);
+        if (!parsed) continue;
+        active.push({ clientName, ...parsed });
+      } else if (fields[0] === "completed" && fields.length === 7) {
+        const [
+          ,
+          eventId,
+          clientName,
+          connectedAt,
+          disconnectedAt,
+          uploadBytes,
+          downloadBytes,
+        ] = fields;
+        if (
+          !eventId ||
+          eventId.length > 160 ||
+          !clientName ||
+          !CLIENT_NAME.test(clientName)
+        ) continue;
+        const parsed = parseTrafficNumbers(connectedAt, uploadBytes, downloadBytes);
+        const disconnected = Number(disconnectedAt);
+        if (!parsed || !Number.isSafeInteger(disconnected) || disconnected < parsed.connectedAt)
+          continue;
+        completed.push({
+          eventId,
+          clientName,
+          ...parsed,
+          disconnectedAt: disconnected,
+        });
+      }
+    }
+    return { active, completed };
+  }
+
   private async execute(serverKey: ServerKey, args: string[]): Promise<Buffer> {
     const server = this.servers[serverKey];
     if (!server)
@@ -144,4 +194,23 @@ export class OpenVpnGateway {
       });
     });
   }
+}
+
+function parseTrafficNumbers(
+  connectedAt: string | undefined,
+  uploadBytes: string | undefined,
+  downloadBytes: string | undefined
+): Pick<ActiveTrafficSession, "connectedAt" | "uploadBytes" | "downloadBytes"> | null {
+  const connected = Number(connectedAt);
+  const upload = Number(uploadBytes);
+  const download = Number(downloadBytes);
+  if (
+    !Number.isSafeInteger(connected) ||
+    connected < 0 ||
+    !Number.isSafeInteger(upload) ||
+    upload < 0 ||
+    !Number.isSafeInteger(download) ||
+    download < 0
+  ) return null;
+  return { connectedAt: connected, uploadBytes: upload, downloadBytes: download };
 }

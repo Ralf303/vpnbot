@@ -8,6 +8,8 @@ PKI_DIR="$EASYRSA_DIR/pki"
 CLIENT_COMMON="$OPENVPN_DIR/client-common.txt"
 LOCK_FILE="/run/lock/openvpn-bot-helper.lock"
 VPN_SUBNET="10.8.0.0/24"
+STATUS_FILE="/run/openvpn-server/server-status.tsv"
+TRAFFIC_EVENTS_DIR="/var/lib/openvpn-bot/traffic-events"
 
 die() {
   printf '%s\n' "$1" >&2
@@ -54,13 +56,13 @@ refresh_crl() {
 
 command="${1:-}"
 case "$command" in
-  list|stats)
+  list|stats|traffic-sessions)
     ;;
   create|download|revoke)
     validate_client "${2:-}"
     ;;
   *)
-    die "Допустимые команды: create, download, revoke, list, stats"
+    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions"
     ;;
 esac
 
@@ -105,5 +107,27 @@ case "$command" in
       download=$((download + $(<"$interface_dir/statistics/tx_bytes")))
     done
     printf '{"uploadBytes":%s,"downloadBytes":%s}\n' "$upload" "$download"
+    ;;
+  traffic-sessions)
+    if [[ -d "$TRAFFIC_EVENTS_DIR" ]]; then
+      find "$TRAFFIC_EVENTS_DIR" -maxdepth 1 -type f -name '*.tsv' -print0 \
+        | sort -z \
+        | xargs -0 -r cat
+    fi
+    if [[ -r "$STATUS_FILE" ]]; then
+      awk -F '\t' '
+        $1 == "HEADER" && $2 == "CLIENT_LIST" {
+          for (i = 3; i <= NF; i++) column[$i] = i - 1
+          next
+        }
+        $1 == "CLIENT_LIST" && column["Common Name"] {
+          printf "active\t%s\t%s\t%s\t%s\n",
+            $(column["Common Name"]),
+            $(column["Connected Since (time_t)"]),
+            $(column["Bytes Received"]),
+            $(column["Bytes Sent"])
+        }
+      ' "$STATUS_FILE"
+    fi
     ;;
 esac

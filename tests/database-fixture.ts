@@ -6,8 +6,10 @@ const databaseUrl = process.env.TEST_DATABASE_URL
 export async function createCleanDatabase(): Promise<AppDatabase> {
   const db = new AppDatabase(databaseUrl);
   await db.prisma.$transaction([
+    db.prisma.trafficEvent.deleteMany(),
     db.prisma.notification.deleteMany(),
     db.prisma.legacyClient.deleteMany(),
+    db.prisma.clientName.deleteMany(),
     db.prisma.vpnConfig.deleteMany(),
     db.prisma.user.deleteMany(),
   ]);

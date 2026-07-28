@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+EVENTS_DIR="/var/lib/openvpn-bot/traffic-events"
+
+client="${common_name:-}"
+duration="${time_duration:-0}"
+upload="${bytes_received:-0}"
+download="${bytes_sent:-0}"
+port="${trusted_port:-0}"
+ended_at="$(date +%s)"
+
+[[ "$client" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]] || exit 0
+[[ "$duration" =~ ^[0-9]+$ ]] || duration=0
+[[ "$upload" =~ ^[0-9]+$ ]] || upload=0
+[[ "$download" =~ ^[0-9]+$ ]] || download=0
+[[ "$port" =~ ^[0-9]+$ ]] || port=0
+
+started_at=$((ended_at - duration))
+event_id="${client}_${started_at}_${ended_at}_${port}"
+
+install -d -m 0700 "$EVENTS_DIR"
+temporary="$(mktemp "$EVENTS_DIR/.traffic.XXXXXX")"
+printf 'completed\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$event_id" "$client" "$started_at" "$ended_at" "$upload" "$download" \
+  >"$temporary"
+chmod 0600 "$temporary"
+mv "$temporary" "$EVENTS_DIR/$event_id.tsv"
