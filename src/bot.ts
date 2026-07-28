@@ -176,6 +176,80 @@ export function createBot(
     );
   });
 
+  bot.callbackQuery("help", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "📖 Как установить VPN\n\nСначала установите официальное приложение OpenVPN Connect. Затем получите файл в разделе «Мои конфиги» и импортируйте его в приложение.\n\nВыберите Ваше устройство:",
+      new InlineKeyboard()
+        .text("🍎 iPhone / iPad", "help_ios")
+        .row()
+        .text("🤖 Android", "help_android")
+        .row()
+        .text("💻 Компьютер", "help_pc")
+        .row()
+        .url("💬 Нужна помощь", appConfig.contactUrl)
+        .row()
+        .text("⬅️ Главное меню", "m")
+    );
+  });
+
+  bot.callbackQuery("help_ios", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "🍎 Установка на iPhone / iPad\n\n1️⃣ Установите OpenVPN Connect из App Store.\n\n2️⃣ В боте откройте «Мои конфиги», выберите нужный конфиг и нажмите «Получить файл».\n\n3️⃣ Нажмите на присланный файл .ovpn. Когда он откроется, нажмите «Поделиться» и выберите OpenVPN.\n\n4️⃣ Подтвердите добавление профиля и нажмите Connect. Если iPhone запросит разрешение на добавление VPN-конфигурации — разрешите.",
+      new InlineKeyboard()
+        .url(
+          "📲 Установить OpenVPN Connect",
+          "https://apps.apple.com/app/openvpn-connect/id590379981"
+        )
+        .row()
+        .url("💬 Возникли трудности", appConfig.contactUrl)
+        .row()
+        .text("⬅️ Выбрать устройство", "help")
+    );
+  });
+
+  bot.callbackQuery("help_android", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "🤖 Установка на Android\n\n1️⃣ Установите OpenVPN Connect из Google Play.\n\n2️⃣ В боте откройте «Мои конфиги», выберите нужный конфиг, нажмите «Получить файл» и скачайте файл .ovpn.\n\n3️⃣ Откройте OpenVPN Connect, нажмите Upload File и выберите скачанный файл. Обычно он находится в папке «Загрузки» или Downloads.\n\n4️⃣ Подтвердите импорт профиля и нажмите Connect.",
+      new InlineKeyboard()
+        .url(
+          "📲 Установить OpenVPN Connect",
+          "https://play.google.com/store/apps/details?id=net.openvpn.openvpn"
+        )
+        .row()
+        .url("💬 Возникли трудности", appConfig.contactUrl)
+        .row()
+        .text("⬅️ Выбрать устройство", "help")
+    );
+  });
+
+  bot.callbackQuery("help_pc", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "💻 Установка на компьютер\n\n1️⃣ Скачайте и установите OpenVPN Connect для Вашей операционной системы.\n\n2️⃣ В боте откройте «Мои конфиги», выберите нужный конфиг, нажмите «Получить файл» и сохраните файл .ovpn.\n\n3️⃣ Перетащите файл .ovpn в окно OpenVPN Connect. Также можно выбрать Upload File или Import Profile → File.\n\n4️⃣ Добавьте профиль и нажмите Connect.",
+      new InlineKeyboard()
+        .url(
+          "🪟 Скачать для Windows",
+          "https://openvpn.net/client-connect-vpn-for-windows/"
+        )
+        .row()
+        .url(
+          "🍎 Скачать для macOS",
+          "https://openvpn.net/connect-docs/connect-for-macos.html"
+        )
+        .row()
+        .url("💬 Возникли трудности", appConfig.contactUrl)
+        .row()
+        .text("⬅️ Выбрать устройство", "help")
+    );
+  });
+
   bot.callbackQuery("ul", async (ctx) => {
     await ctx.answerCallbackQuery();
     const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
@@ -470,7 +544,9 @@ function mainKeyboard(admin: boolean, contactUrl: string): InlineKeyboard {
   const keyboard = new InlineKeyboard()
     .text("🗂 Мои конфиги", "ul")
     .row()
-    .url("💳 Оплатить или продлить", contactUrl);
+    .url("💳 Оплатить или продлить", contactUrl)
+    .row()
+    .text("📖 Как установить", "help");
   if (admin) keyboard.row().text("🛠 Админ-панель", "a");
   return keyboard;
 }
