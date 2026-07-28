@@ -115,6 +115,15 @@ export class AppDatabase {
     await this.prisma.vpnConfig.create({ data: configData(config) });
   }
 
+  async reserveClientName(name: string): Promise<boolean> {
+    const inserted = await this.prisma.$executeRaw`
+      INSERT INTO "client_names" ("name")
+      VALUES (${name})
+      ON CONFLICT ("name") DO NOTHING
+    `;
+    return inserted === 1;
+  }
+
   async insertConfigAndAssignLegacy(config: VpnConfigRecord, legacyId: number): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       const legacy = await tx.legacyClient.findFirst({

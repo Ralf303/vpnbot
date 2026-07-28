@@ -42,8 +42,24 @@ describe("ConfigService", () => {
     const user = await db.upsertUser({ telegramId: "100", firstName: "Иван" });
     const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
     expect(config.serverKey).toBe("new");
-    expect(vpn.calls[0]).toMatch(/^create:new:tg100_/);
+    expect(config.clientName).toMatch(/^[a-z]{12}$/);
+    expect(vpn.calls[0]).toBe(`create:new:${config.clientName}`);
     expect(await db.listVisibleConfigs(user.id)).toHaveLength(1);
+  });
+
+  it("выдаёт разные технические имена и не меняет их при переименовании", async () => {
+    const user = await db.upsertUser({ telegramId: "101", firstName: "Анна" });
+    const first = await service.issue(user, "2027-01-01T20:59:59.999Z");
+    const second = await service.issue(user, "2027-02-01T20:59:59.999Z");
+
+    expect(first.clientName).not.toBe(second.clientName);
+    await db.updateDisplayName(first.id, "Рабочий ноутбук 💻");
+    const renamed = (await db.getConfig(first.id))!;
+    await service.download(renamed);
+
+    expect(renamed.displayName).toBe("Рабочий ноутбук 💻");
+    expect(renamed.clientName).toBe(first.clientName);
+    expect(vpn.calls.at(-1)).toBe(`download:new:${first.clientName}`);
   });
 
   it("откатывает миграцию, если старый клиент не удалось отозвать", async () => {

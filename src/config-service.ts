@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { AppDatabase } from "./database.js";
 import type {
   LegacyClientRecord,
@@ -13,8 +13,14 @@ export interface VpnOperations {
   revokeClient(serverKey: "new" | "old", clientName: string): Promise<void>;
 }
 
-function technicalClientName(telegramId: string): string {
-  return `tg${telegramId}_${randomBytes(5).toString("hex")}`.slice(0, 64);
+const CLIENT_NAME_LENGTH = 12;
+const CLIENT_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
+
+function randomClientName(): string {
+  return Array.from(
+    { length: CLIENT_NAME_LENGTH },
+    () => CLIENT_NAME_ALPHABET[randomInt(CLIENT_NAME_ALPHABET.length)]!
+  ).join("");
 }
 
 export class ConfigService {
@@ -24,8 +30,7 @@ export class ConfigService {
   ) {}
 
   async issue(user: UserRecord, expiresAt: string): Promise<VpnConfigRecord> {
-    const clientName = technicalClientName(user.telegramId);
-    await this.vpn.createClient("new", clientName);
+    const { clientName } = await this.createUniqueClient();
     const now = new Date().toISOString();
     const record: VpnConfigRecord = {
       id: randomUUID(),
@@ -92,14 +97,16 @@ export class ConfigService {
     return this.vpn.downloadClient(config.serverKey, config.clientName);
   }
 
-  async migrateLegacy(config: VpnConfigRecord): Promise<Buffer> {
+  async migrateLegacy(config: VpnConfigRecord): Promise<{
+    file: Buffer;
+    clientName: string;
+  }> {
     if (!config.isLegacy || config.serverKey !== "old")
       throw new Error("Конфиг уже находится на новом сервере");
     if (config.status !== "active" || isExpired(config.expiresAt))
       throw new Error("Сначала продлите срок действия конфига");
 
-    const newClientName = technicalClientName(String(config.userId));
-    const file = await this.vpn.createClient("new", newClientName);
+    const { clientName: newClientName, file } = await this.createUniqueClient();
     try {
       await this.db.replaceClient(
         config.id,
@@ -121,7 +128,7 @@ export class ConfigService {
 
     try {
       await this.vpn.revokeClient("old", config.clientName);
-      return file;
+      return { file, clientName: newClientName };
     } catch (error) {
       await this.db.restoreLegacyClient(
         config.id,
@@ -147,8 +154,7 @@ export class ConfigService {
   ): Promise<VpnConfigRecord> {
     const hiddenAt = hiddenAtFromExpiry(expiresAt);
     if (config.status === "expired" || config.revokedAt) {
-      const newClientName = technicalClientName(String(config.userId));
-      await this.vpn.createClient("new", newClientName);
+      const { clientName: newClientName } = await this.createUniqueClient();
       try {
         await this.db.replaceClient(config.id, newClientName, expiresAt, hiddenAt);
       } catch (error) {
@@ -173,5 +179,18 @@ export class ConfigService {
       await this.vpn.revokeClient(config.serverKey, config.clientName);
     }
     await this.db.markRevoked(config.id);
+  }
+
+  private async createUniqueClient(): Promise<{
+    clientName: string;
+    file: Buffer;
+  }> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const clientName = randomClientName();
+      if (!(await this.db.reserveClientName(clientName))) continue;
+      const file = await this.vpn.createClient("new", clientName);
+      return { clientName, file };
+    }
+    throw new Error("Не удалось сгенерировать уникальное имя VPN-конфига");
   }
 }

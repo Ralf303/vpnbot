@@ -9,6 +9,7 @@ import type {
   VpnConfigRecord,
 } from "./domain.js";
 import { OpenVpnGateway } from "./openvpn.js";
+import { vpnFileName } from "./file-name.js";
 import {
   dateAfterDays,
   expiryFromDate,
@@ -59,7 +60,7 @@ export function createBot(
   bot.command("start", async (ctx) => {
     pendingInputs.delete(String(ctx.from?.id ?? ""));
     await ctx.reply(
-      "Добро пожаловать. Здесь Вы можете получить свои VPN-конфиги и проверить срок их действия.",
+      "👋 Добро пожаловать! Здесь Вы можете получить свои VPN-конфиги и проверить срок их действия.",
       {
         reply_markup: mainKeyboard(
           isAdmin(ctx, appConfig),
@@ -92,9 +93,9 @@ export function createBot(
           "Пользователь не найден. Он должен хотя бы один раз запустить бота.",
           {
             reply_markup: new InlineKeyboard()
-              .text("Повторить поиск", "as")
+              .text("🔎 Повторить поиск", "as")
               .row()
-              .text("Назад", "a"),
+              .text("⬅️ Назад", "a"),
           }
         );
       } else {
@@ -130,11 +131,11 @@ export function createBot(
         return;
       }
       await db.updateDisplayName(config.id, name);
-      await ctx.reply(`Название изменено на «${name}».`, {
+      await ctx.reply(`✅ Название изменено на «${name}».`, {
         reply_markup: new InlineKeyboard()
-          .text("Открыть конфиг", `uc|${config.id}`)
+          .text("🔎 Открыть конфиг", `uc|${config.id}`)
           .row()
-          .text("Главное меню", "m"),
+          .text("🏠 Главное меню", "m"),
       });
       return;
     }
@@ -166,7 +167,7 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      "Личный кабинет",
+      "🏠 Личный кабинет",
       mainKeyboard(isAdmin(ctx, appConfig), appConfig.contactUrl)
     );
   });
@@ -181,14 +182,14 @@ export function createBot(
         .text(`${statusIcon(config)} ${config.displayName}`, `uc|${config.id}`)
         .row();
     }
-    keyboard.text("Назад", "m");
+    keyboard.text("⬅️ Назад", "m");
     const suffix =
       configs.length > 40 ? "\n\nПоказаны первые 40 конфигов." : "";
     await edit(
       ctx,
       configs.length
-        ? `Ваши конфиги:${suffix}`
-        : "У Вас пока нет доступных конфигов.",
+        ? `🗂 Ваши конфиги:${suffix}`
+        : "📭 У Вас пока нет доступных конфигов.",
       keyboard
     );
   });
@@ -210,8 +211,8 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      `Отправьте новое название для «${config.displayName}». Не более 40 символов.`,
-      new InlineKeyboard().text("Отмена", `uc|${config.id}`)
+      `✏️ Отправьте новое название для «${config.displayName}». Не более 40 символов.`,
+      new InlineKeyboard().text("❌ Отмена", `uc|${config.id}`)
     );
   });
 
@@ -227,9 +228,9 @@ export function createBot(
     try {
       const file = await configService.download(config);
       await ctx.replyWithDocument(
-        new InputFile(file, `${safeFileName(config.displayName)}.ovpn`),
+        new InputFile(file, vpnFileName(config.clientName)),
         {
-          caption: `Конфиг «${config.displayName}». Действует до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
+          caption: `🔐 Конфиг «${config.displayName}». Действует до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
         }
       );
     } catch (error) {
@@ -255,9 +256,9 @@ export function createBot(
       ctx,
       "Этот конфиг хранится на старом сервере. Чтобы получить файл повторно, его необходимо перенести. Старый файл перестанет подключаться, вместо него будет создан новый с тем же сроком действия.",
       new InlineKeyboard()
-        .text("Перенести и получить", `lmc|${config.id}`)
+        .text("🔄 Перенести и получить", `lmc|${config.id}`)
         .row()
-        .text("Отмена", `uc|${config.id}`)
+        .text("❌ Отмена", `uc|${config.id}`)
     );
   });
 
@@ -270,17 +271,17 @@ export function createBot(
     operationLocks.add(config.id);
     await ctx.answerCallbackQuery({ text: "Выполняю перенос…" });
     try {
-      const file = await configService.migrateLegacy(config);
+      const migrated = await configService.migrateLegacy(config);
       await edit(
         ctx,
-        "Конфиг перенесён на новый сервер. Старый файл отозван и больше не подключится.",
+        "✅ Конфиг перенесён на новый сервер. Старый файл отозван и больше не подключится.",
         new InlineKeyboard()
-          .text("Открыть конфиг", `uc|${config.id}`)
+          .text("🔎 Открыть конфиг", `uc|${config.id}`)
           .row()
-          .text("Главное меню", "m")
+          .text("🏠 Главное меню", "m")
       );
       await ctx.replyWithDocument(
-        new InputFile(file, `${safeFileName(config.displayName)}.ovpn`),
+        new InputFile(migrated.file, vpnFileName(migrated.clientName)),
         {
           caption: `Новый файл «${config.displayName}». Срок действия сохранён: до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
         }
@@ -314,8 +315,8 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      "Отправьте username пользователя или его числовой Telegram ID.",
-      new InlineKeyboard().text("Отмена", "a")
+      "🔎 Отправьте username пользователя или его числовой Telegram ID.",
+      new InlineKeyboard().text("❌ Отмена", "a")
     );
   });
 
@@ -383,8 +384,8 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      "Отправьте дату окончания в формате ГГГГ-ММ-ДД, например 2026-12-31.",
-      new InlineKeyboard().text("Отмена", "a")
+      "📅 Отправьте дату окончания в формате ГГГГ-ММ-ДД, например 2026-12-31.",
+      new InlineKeyboard().text("❌ Отмена", "a")
     );
   });
 
@@ -434,9 +435,9 @@ export function createBot(
       ctx,
       `Отозвать «${config.displayName}»? Файл сразу перестанет подключаться и исчезнет у пользователя.`,
       new InlineKeyboard()
-        .text("Подтвердить отзыв", `arc|${config.id}`)
+        .text("⛔ Подтвердить отзыв", `arc|${config.id}`)
         .row()
-        .text("Отмена", `ac|${config.id}`)
+        .text("❌ Отмена", `ac|${config.id}`)
     );
   });
 
@@ -462,11 +463,11 @@ export function createBot(
       }
       await edit(
         ctx,
-        "Конфиг отозван.",
+        "✅ Конфиг отозван.",
         new InlineKeyboard()
-          .text("К пользователю", `au|${config.userId}`)
+          .text("👤 К пользователю", `au|${config.userId}`)
           .row()
-          .text("Админ-панель", "a")
+          .text("🛠 Админ-панель", "a")
       );
     } catch (error) {
       logError(error);
@@ -486,22 +487,22 @@ export function createBot(
 
 function mainKeyboard(admin: boolean, contactUrl: string): InlineKeyboard {
   const keyboard = new InlineKeyboard()
-    .text("Мои конфиги", "ul")
+    .text("🗂 Мои конфиги", "ul")
     .row()
-    .url("Оплатить или продлить", contactUrl);
-  if (admin) keyboard.row().text("Админ-панель", "a");
+    .url("💳 Оплатить или продлить", contactUrl);
+  if (admin) keyboard.row().text("🛠 Админ-панель", "a");
   return keyboard;
 }
 
 function backToMainKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().text("Главное меню", "m");
+  return new InlineKeyboard().text("🏠 Главное меню", "m");
 }
 
 function usersKeyboard(users: UserRecord[]): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   for (const user of users)
     keyboard.text(userLabel(user), `au|${user.id}`).row();
-  return keyboard.text("Новый поиск", "as").row().text("Админ-панель", "a");
+  return keyboard.text("🔎 Новый поиск", "as").row().text("🛠 Админ-панель", "a");
 }
 
 async function showUserConfig(
@@ -512,19 +513,19 @@ async function showUserConfig(
   const expired = isExpired(config.expiresAt) || config.status === "expired";
   const status = expired ? "Просрочен" : "Активен";
   const keyboard = new InlineKeyboard()
-    .text("Переименовать", `rn|${config.id}`)
+    .text("✏️ Переименовать", `rn|${config.id}`)
     .row();
   if (expired) {
-    keyboard.url("Продлить", appConfig.contactUrl).row();
+    keyboard.url("💳 Продлить", appConfig.contactUrl).row();
   } else if (config.isLegacy) {
-    keyboard.text("Получить файл", `lm|${config.id}`).row();
+    keyboard.text("📥 Получить файл", `lm|${config.id}`).row();
   } else {
-    keyboard.text("Получить файл", `dl|${config.id}`).row();
+    keyboard.text("📥 Получить файл", `dl|${config.id}`).row();
   }
-  keyboard.text("Назад", "ul").text("Главное меню", "m");
+  keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");
   await edit(
     ctx,
-    `Конфиг: ${config.displayName}\nСтатус: ${status}\nДействует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
+    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
     keyboard
   );
 }
@@ -548,24 +549,24 @@ async function showAdminMain(
   );
 
   const text = [
-    "Админ-панель",
+    "🛠 Админ-панель",
     "",
-    `Пользователей: ${stats.users}`,
-    `Активных конфигов: ${stats.active}`,
-    `Просроченных в меню: ${stats.expired}`,
+    `👥 Пользователей: ${stats.users}`,
+    `🟢 Активных конфигов: ${stats.active}`,
+    `🔴 Просроченных в меню: ${stats.expired}`,
     `На новом сервере: ${stats.new}`,
     `На старом сервере: ${stats.old}`,
     "",
-    "VPN-трафик по счётчикам сервера:",
+    "📊 VPN-трафик по счётчикам сервера:",
     ...trafficLines,
   ].join("\n");
   await edit(
     ctx,
     text,
     new InlineKeyboard()
-      .text("Найти пользователя", "as")
+      .text("🔎 Найти пользователя", "as")
       .row()
-      .text("Главное меню", "m")
+      .text("🏠 Главное меню", "m")
   );
 }
 
@@ -580,9 +581,9 @@ async function showAdminUser(
     keyboard
       .text(`${statusIcon(config)} ${config.displayName}`, `ac|${config.id}`)
       .row();
-  keyboard.text("Выдать новый конфиг", `ai|${user.id}`).row();
-  keyboard.text("Привязать старый конфиг", `ab|${user.id}`).row();
-  keyboard.text("Новый поиск", "as").text("Админ-панель", "a");
+  keyboard.text("➕ Выдать новый конфиг", `ai|${user.id}`).row();
+  keyboard.text("🔗 Привязать старый конфиг", `ab|${user.id}`).row();
+  keyboard.text("🔎 Новый поиск", "as").text("🛠 Админ-панель", "a");
   await edit(
     ctx,
     `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}`,
@@ -610,12 +611,12 @@ async function showAdminConfig(
     ctx,
     text,
     new InlineKeyboard()
-      .text(expired ? "Продлить" : "Изменить срок", `ae|${config.id}`)
+      .text(expired ? "💳 Продлить" : "📅 Изменить срок", `ae|${config.id}`)
       .row()
-      .text("Отозвать", `ar|${config.id}`)
+      .text("⛔ Отозвать", `ar|${config.id}`)
       .row()
-      .text("К пользователю", `au|${config.userId}`)
-      .text("Админ-панель", "a")
+      .text("👤 К пользователю", `au|${config.userId}`)
+      .text("🛠 Админ-панель", "a")
   );
 }
 
@@ -628,15 +629,15 @@ async function showDateMenu(
   const { code, value } = encodeDateTarget(target);
   await edit(
     ctx,
-    `Выберите дату окончания. Быстрые варианты считаются от сегодняшней даты (${DateTime.now().setZone(timezone).toFormat("dd.MM.yyyy")}).`,
+    `📅 Выберите дату окончания. Быстрые варианты считаются от сегодняшней даты (${DateTime.now().setZone(timezone).toFormat("dd.MM.yyyy")}).`,
     new InlineKeyboard()
       .text("+30 дней", `dt|${code}|${value}|30`)
       .text("+60 дней", `dt|${code}|${value}|60`)
       .text("+90 дней", `dt|${code}|${value}|90`)
       .row()
-      .text("Указать дату", `dc|${code}|${value}`)
+      .text("📅 Указать дату", `dc|${code}|${value}`)
       .row()
-      .text("Назад", `au|${backUserId}`)
+      .text("⬅️ Назад", `au|${backUserId}`)
   );
 }
 
@@ -687,15 +688,15 @@ async function applyDateTarget(
         user,
         config,
         appConfig,
-        "Новый конфиг готов."
+        "✅ Новый конфиг готов."
       );
       await respond(
         ctx,
         `Конфиг «${config.displayName}» выдан пользователю ${userLabel(user)}.`,
         new InlineKeyboard()
-          .text("Открыть конфиг", `ac|${config.id}`)
+          .text("🔎 Открыть конфиг", `ac|${config.id}`)
           .row()
-          .text("К пользователю", `au|${user.id}`)
+          .text("👤 К пользователю", `au|${user.id}`)
       );
       return;
     }
@@ -719,9 +720,9 @@ async function applyDateTarget(
         ctx,
         `Клиент «${legacy.clientName}» привязан к ${userLabel(user)}.`,
         new InlineKeyboard()
-          .text("Открыть конфиг", `ac|${config.id}`)
+          .text("🔎 Открыть конфиг", `ac|${config.id}`)
           .row()
-          .text("К пользователю", `au|${user.id}`)
+          .text("👤 К пользователю", `au|${user.id}`)
       );
       return;
     }
@@ -737,22 +738,22 @@ async function applyDateTarget(
         user,
         updated,
         appConfig,
-        "Срок действия конфига изменён."
+        "✅ Срок действия конфига изменён."
       );
     await respond(
       ctx,
       `Новый срок для «${updated.displayName}»: ${formatDate(expiresAt, appConfig.timezone)}.`,
       new InlineKeyboard()
-        .text("Открыть конфиг", `ac|${updated.id}`)
+        .text("🔎 Открыть конфиг", `ac|${updated.id}`)
         .row()
-        .text("К пользователю", `au|${updated.userId}`)
+        .text("👤 К пользователю", `au|${updated.userId}`)
     );
   } catch (error) {
     logError(error);
     await respond(
       ctx,
       "Операцию выполнить не удалось. Данные не были изменены.",
-      new InlineKeyboard().text("Админ-панель", "a")
+      new InlineKeyboard().text("🛠 Админ-панель", "a")
     );
   } finally {
     operationLocks.delete(lockKey);
@@ -772,9 +773,9 @@ async function notifyConfigReady(
       `${prefix}\n«${config.displayName}» действует до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
       {
         reply_markup: new InlineKeyboard()
-          .text("Открыть конфиг", `uc|${config.id}`)
+          .text("🔎 Открыть конфиг", `uc|${config.id}`)
           .row()
-          .text("Главное меню", "m"),
+          .text("🏠 Главное меню", "m"),
       }
     )
     .catch(logError);
@@ -817,13 +818,6 @@ function isAdmin(ctx: Context, config: AppConfig): boolean {
 function normalizeDisplayName(value: string): string | null {
   const name = value.replace(/\s+/g, " ").trim();
   return name.length >= 1 && name.length <= 40 ? name : null;
-}
-
-function safeFileName(value: string): string {
-  const safe = value
-    .replace(/[^\p{L}\p{N}._-]+/gu, "_")
-    .replace(/^_+|_+$/g, "");
-  return safe.slice(0, 50) || "vpn-config";
 }
 
 function parseFutureDate(value: string, timezone: string): string | null {

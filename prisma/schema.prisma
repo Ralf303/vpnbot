@@ -80,3 +80,10 @@ model LegacyClient {
   @@index([assignedConfigId])
   @@map("legacy_clients")
 }
+
+model ClientName {
+  name      String   @id @db.VarChar(64)
+  createdAt DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  @@map("client_names")
+}
