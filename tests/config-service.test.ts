@@ -113,6 +113,8 @@ describe("ConfigService", () => {
     const legacy = (await db.listUnassignedLegacyClients("old"))[0]!;
     const config = await service.bindLegacy(user, legacy, "2027-01-01T20:59:59.999Z");
 
+    expect(config.displayName).toBe("legacy_download.ovpn");
+    expect(config.clientName).toBe("legacy_download");
     await expect(service.download(config)).resolves.toBeInstanceOf(Buffer);
     expect(vpn.calls.at(-1)).toBe("download:old:legacy_download");
   });

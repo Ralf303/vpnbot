@@ -6,6 +6,7 @@ import type {
   UserRecord,
   VpnConfigRecord,
 } from "./domain.js";
+import { vpnFileName } from "./file-name.js";
 import { hiddenAtFromExpiry, isExpired } from "./time.js";
 
 export interface VpnOperations {
@@ -77,7 +78,7 @@ export class ConfigService {
     const record: VpnConfigRecord = {
       id: randomUUID(),
       userId: user.id,
-      displayName: `VPN #${await this.db.nextConfigNumber(user.id)}`,
+      displayName: vpnFileName(legacy.clientName),
       clientName: legacy.clientName,
       serverKey: legacy.serverKey,
       expiresAt,
