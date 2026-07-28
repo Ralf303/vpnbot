@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+.tmp/
+src/generated/prisma/
+.env
+*.log
+*.key
+*.pem
+*.ovpn
+.idea/
+.vscode/

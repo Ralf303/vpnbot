@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+OPENVPN_DIR="/etc/openvpn/server"
+EASYRSA_DIR="$OPENVPN_DIR/easy-rsa"
+PKI_DIR="$EASYRSA_DIR/pki"
+CLIENT_COMMON="$OPENVPN_DIR/client-common.txt"
+LOCK_FILE="/run/lock/openvpn-bot-helper.lock"
+VPN_SUBNET="10.8.0.0/24"
+
+die() {
+  printf '%s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+validate_installation() {
+  [[ -x "$EASYRSA_DIR/easyrsa" ]] || die "Easy-RSA не найден"
+  [[ -f "$CLIENT_COMMON" ]] || die "Шаблон client-common.txt не найден"
+  [[ -f "$PKI_DIR/index.txt" ]] || die "Индекс PKI не найден"
+}
+
+validate_client() {
+  local client="${1:-}"
+  [[ "$client" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "Некорректное имя клиента"
+}
+
+is_valid_client() {
+  local client="$1"
+  awk -F= -v client="$client" '$1 ~ /^V/ && $NF == client { found=1 } END { exit !found }' "$PKI_DIR/index.txt"
+}
+
+is_revoked_client() {
+  local client="$1"
+  awk -F= -v client="$client" '$1 ~ /^R/ && $NF == client { found=1 } END { exit !found }' "$PKI_DIR/index.txt"
+}
+
+render_client() {
+  local client="$1"
+  local inline="$PKI_DIR/inline/private/$client.inline"
+  [[ -f "$inline" ]] || die "Данные клиента не найдены"
+  grep -vh '^#' "$CLIENT_COMMON" "$inline"
+}
+
+refresh_crl() {
+  local group_name
+  group_name="$(stat -c '%G' "$OPENVPN_DIR/crl.pem" 2>/dev/null || true)"
+  [[ -n "$group_name" ]] || group_name="nogroup"
+  rm -f "$OPENVPN_DIR/crl.pem"
+  cp "$PKI_DIR/crl.pem" "$OPENVPN_DIR/crl.pem"
+  chown nobody:"$group_name" "$OPENVPN_DIR/crl.pem"
+  chmod 0644 "$OPENVPN_DIR/crl.pem"
+}
+
+command="${1:-}"
+case "$command" in
+  list|stats)
+    ;;
+  create|download|revoke)
+    validate_client "${2:-}"
+    ;;
+  *)
+    die "Допустимые команды: create, download, revoke, list, stats"
+    ;;
+esac
+
+validate_installation
+exec 9>"$LOCK_FILE"
+flock -w 30 9 || die "Сервер занят другой операцией"
+
+case "$command" in
+  create)
+    client="$2"
+    [[ ! -e "$PKI_DIR/issued/$client.crt" ]] || die "Клиент уже существует"
+    cd "$EASYRSA_DIR"
+    ./easyrsa --batch --days=3650 build-client-full "$client" nopass >/dev/null
+    render_client "$client"
+    ;;
+  download)
+    client="$2"
+    is_valid_client "$client" || die "Клиент не активен"
+    render_client "$client"
+    ;;
+  revoke)
+    client="$2"
+    if is_revoked_client "$client"; then
+      exit 0
+    fi
+    is_valid_client "$client" || die "Активный клиент не найден"
+    cd "$EASYRSA_DIR"
+    ./easyrsa --batch revoke "$client" >/dev/null
+    ./easyrsa --batch --days=3650 gen-crl >/dev/null
+    rm -f "$PKI_DIR/reqs/$client.req" "$PKI_DIR/private/$client.key"
+    refresh_crl
+    ;;
+  list)
+    tail -n +2 "$PKI_DIR/index.txt" | awk -F= '$1 ~ /^V/ { print $NF }'
+    ;;
+  stats)
+    upload=0
+    download=0
+    for interface_dir in /sys/class/net/tun*; do
+      [[ -d "$interface_dir/statistics" ]] || continue
+      upload=$((upload + $(<"$interface_dir/statistics/rx_bytes")))
+      download=$((download + $(<"$interface_dir/statistics/tx_bytes")))
+    done
+    printf '{"uploadBytes":%s,"downloadBytes":%s}\n' "$upload" "$download"
+    ;;
+esac

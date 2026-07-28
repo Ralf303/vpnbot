@@ -1,0 +1,82 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ServerKey {
+  new
+  old
+}
+
+enum ConfigStatus {
+  active
+  expired
+  revoked
+  error
+}
+
+model User {
+  id         Int         @id @default(autoincrement())
+  telegramId String      @unique @map("telegram_id")
+  username   String?
+  firstName  String      @map("first_name")
+  createdAt  DateTime    @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt  DateTime    @updatedAt @db.Timestamptz(3) @map("updated_at")
+  configs    VpnConfig[]
+
+  @@index([username])
+  @@map("users")
+}
+
+model VpnConfig {
+  id             String         @id @default(uuid()) @db.Uuid
+  userId         Int            @map("user_id")
+  displayName    String         @map("display_name")
+  clientName     String         @map("client_name")
+  serverKey      ServerKey      @map("server_key")
+  expiresAt      DateTime       @db.Timestamptz(3) @map("expires_at")
+  status         ConfigStatus   @default(active)
+  isLegacy       Boolean        @default(false) @map("is_legacy")
+  revokedAt      DateTime?      @db.Timestamptz(3) @map("revoked_at")
+  hiddenAt       DateTime       @db.Timestamptz(3) @map("hidden_at")
+  createdAt      DateTime       @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt      DateTime       @updatedAt @db.Timestamptz(3) @map("updated_at")
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notifications  Notification[]
+  legacyClients  LegacyClient[]
+
+  @@unique([serverKey, clientName])
+  @@index([userId])
+  @@index([status, expiresAt])
+  @@map("vpn_configs")
+}
+
+model Notification {
+  id        Int       @id @default(autoincrement())
+  configId  String    @db.Uuid @map("config_id")
+  kind      String
+  localDate String    @map("local_date")
+  sentAt    DateTime  @default(now()) @db.Timestamptz(3) @map("sent_at")
+  config    VpnConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@unique([configId, kind, localDate])
+  @@map("notifications")
+}
+
+model LegacyClient {
+  id               Int        @id @default(autoincrement())
+  serverKey        ServerKey  @map("server_key")
+  clientName       String     @map("client_name")
+  assignedConfigId String?    @db.Uuid @map("assigned_config_id")
+  discoveredAt     DateTime   @default(now()) @db.Timestamptz(3) @map("discovered_at")
+  assignedConfig   VpnConfig? @relation(fields: [assignedConfigId], references: [id], onDelete: SetNull)
+
+  @@unique([serverKey, clientName])
+  @@index([assignedConfigId])
+  @@map("legacy_clients")
+}

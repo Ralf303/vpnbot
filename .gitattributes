@@ -1,0 +1,3 @@
+*.sh text eol=lf
+deploy/openvpn-bot-helper text eol=lf
+deploy/sudoers-vpn-bot text eol=lf

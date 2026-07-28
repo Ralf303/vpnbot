@@ -1,0 +1,910 @@
+import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
+import { DateTime } from "luxon";
+import type { AppConfig } from "./config.js";
+import { ConfigService } from "./config-service.js";
+import { AppDatabase } from "./database.js";
+import type {
+  LegacyClientRecord,
+  UserRecord,
+  VpnConfigRecord,
+} from "./domain.js";
+import { OpenVpnGateway } from "./openvpn.js";
+import {
+  dateAfterDays,
+  expiryFromDate,
+  formatDate,
+  isExpired,
+} from "./time.js";
+
+type DateTarget =
+  | { kind: "issue"; userId: number }
+  | { kind: "bind"; userId: number; legacyId: number }
+  | { kind: "change"; configId: string };
+
+type PendingInput =
+  | { kind: "search" }
+  | { kind: "rename"; configId: string }
+  | { kind: "date"; target: DateTarget };
+
+const pendingInputs = new Map<string, PendingInput>();
+const operationLocks = new Set<string>();
+
+export interface BotApplication {
+  bot: Bot;
+}
+
+export function createBot(
+  appConfig: AppConfig,
+  db: AppDatabase,
+  vpn: OpenVpnGateway,
+  configService: ConfigService
+): BotApplication {
+  const bot = new Bot(appConfig.botToken);
+
+  bot.catch((error) => {
+    console.error("Необработанная ошибка Telegram-бота", error.error);
+  });
+
+  bot.use(async (ctx, next) => {
+    if (ctx.from) {
+      await db.upsertUser({
+        telegramId: String(ctx.from.id),
+        ...(ctx.from.username ? { username: ctx.from.username } : {}),
+        firstName: ctx.from.first_name || "Пользователь",
+      });
+    }
+    await next();
+  });
+
+  bot.command("start", async (ctx) => {
+    pendingInputs.delete(String(ctx.from?.id ?? ""));
+    await ctx.reply(
+      "Добро пожаловать. Здесь Вы можете получить свои VPN-конфиги и проверить срок их действия.",
+      {
+        reply_markup: mainKeyboard(
+          isAdmin(ctx, appConfig),
+          appConfig.contactUrl
+        ),
+      }
+    );
+  });
+
+  bot.on("message:text", async (ctx) => {
+    if (ctx.message.text.startsWith("/")) return;
+    const telegramId = String(ctx.from.id);
+    const pending = pendingInputs.get(telegramId);
+    if (!pending) {
+      await ctx.reply("Выберите действие с помощью кнопок ниже.", {
+        reply_markup: mainKeyboard(
+          isAdmin(ctx, appConfig),
+          appConfig.contactUrl
+        ),
+      });
+      return;
+    }
+    pendingInputs.delete(telegramId);
+
+    if (pending.kind === "search") {
+      if (!isAdmin(ctx, appConfig)) return;
+      const users = await db.searchUsers(ctx.message.text);
+      if (users.length === 0) {
+        await ctx.reply(
+          "Пользователь не найден. Он должен хотя бы один раз запустить бота.",
+          {
+            reply_markup: new InlineKeyboard()
+              .text("Повторить поиск", "as")
+              .row()
+              .text("Назад", "a"),
+          }
+        );
+      } else {
+        await ctx.reply("Найден пользователь:", {
+          reply_markup: usersKeyboard(users),
+        });
+      }
+      return;
+    }
+
+    if (pending.kind === "rename") {
+      const config = await db.getConfig(pending.configId);
+      const user = await db.getUserByTelegramId(telegramId);
+      if (
+        !config ||
+        !user ||
+        config.userId !== user.id ||
+        config.status === "revoked"
+      ) {
+        await ctx.reply("Конфиг не найден.", {
+          reply_markup: backToMainKeyboard(),
+        });
+        return;
+      }
+      const name = normalizeDisplayName(ctx.message.text);
+      if (!name) {
+        await ctx.reply("Название должно содержать от 1 до 40 символов.", {
+          reply_markup: new InlineKeyboard()
+            .text("Попробовать снова", `rn|${config.id}`)
+            .row()
+            .text("Назад", `uc|${config.id}`),
+        });
+        return;
+      }
+      await db.updateDisplayName(config.id, name);
+      await ctx.reply(`Название изменено на «${name}».`, {
+        reply_markup: new InlineKeyboard()
+          .text("Открыть конфиг", `uc|${config.id}`)
+          .row()
+          .text("Главное меню", "m"),
+      });
+      return;
+    }
+
+    if (!isAdmin(ctx, appConfig)) return;
+    const expiresAt = parseFutureDate(ctx.message.text, appConfig.timezone);
+    if (!expiresAt) {
+      pendingInputs.set(telegramId, pending);
+      await ctx.reply(
+        "Укажите дату в формате ГГГГ-ММ-ДД. Дата не должна быть раньше сегодняшнего дня.",
+        {
+          reply_markup: new InlineKeyboard().text("Отмена", "a"),
+        }
+      );
+      return;
+    }
+    await applyDateTarget(
+      ctx,
+      pending.target,
+      expiresAt,
+      appConfig,
+      db,
+      configService
+    );
+  });
+
+  bot.callbackQuery("m", async (ctx) => {
+    pendingInputs.delete(String(ctx.from.id));
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "Личный кабинет",
+      mainKeyboard(isAdmin(ctx, appConfig), appConfig.contactUrl)
+    );
+  });
+
+  bot.callbackQuery("ul", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
+    const configs = await db.listVisibleConfigs(user.id);
+    const keyboard = new InlineKeyboard();
+    for (const config of configs.slice(0, 40)) {
+      keyboard
+        .text(`${statusIcon(config)} ${config.displayName}`, `uc|${config.id}`)
+        .row();
+    }
+    keyboard.text("Назад", "m");
+    const suffix =
+      configs.length > 40 ? "\n\nПоказаны первые 40 конфигов." : "";
+    await edit(
+      ctx,
+      configs.length
+        ? `Ваши конфиги:${suffix}`
+        : "У Вас пока нет доступных конфигов.",
+      keyboard
+    );
+  });
+
+  bot.callbackQuery(/^uc\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery();
+    await showUserConfig(ctx, config, appConfig);
+  });
+
+  bot.callbackQuery(/^rn\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    pendingInputs.set(String(ctx.from.id), {
+      kind: "rename",
+      configId: config.id,
+    });
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `Отправьте новое название для «${config.displayName}». Не более 40 символов.`,
+      new InlineKeyboard().text("Отмена", `uc|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^dl\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (config.isLegacy)
+      return showAlert(ctx, "Для старого конфига требуется перенос.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Срок действия конфига истёк.");
+
+    await ctx.answerCallbackQuery({ text: "Подготавливаю файл…" });
+    try {
+      const file = await configService.download(config);
+      await ctx.replyWithDocument(
+        new InputFile(file, `${safeFileName(config.displayName)}.ovpn`),
+        {
+          caption: `Конфиг «${config.displayName}». Действует до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
+        }
+      );
+    } catch (error) {
+      logError(error);
+      await ctx.reply(
+        "Не удалось получить файл. Попробуйте позднее или свяжитесь с администратором.",
+        {
+          reply_markup: new InlineKeyboard()
+            .url("Связаться с администратором", appConfig.contactUrl)
+            .row()
+            .text("Назад", `uc|${config.id}`),
+        }
+      );
+    }
+  });
+
+  bot.callbackQuery(/^lm\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config || !config.isLegacy)
+      return showAlert(ctx, "Конфиг не найден или уже перенесён.");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "Этот конфиг хранится на старом сервере. Чтобы получить файл повторно, его необходимо перенести. Старый файл перестанет подключаться, вместо него будет создан новый с тем же сроком действия.",
+      new InlineKeyboard()
+        .text("Перенести и получить", `lmc|${config.id}`)
+        .row()
+        .text("Отмена", `uc|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^lmc\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config || !config.isLegacy)
+      return showAlert(ctx, "Конфиг не найден или уже перенесён.");
+    if (operationLocks.has(config.id))
+      return showAlert(ctx, "Перенос уже выполняется.");
+    operationLocks.add(config.id);
+    await ctx.answerCallbackQuery({ text: "Выполняю перенос…" });
+    try {
+      const file = await configService.migrateLegacy(config);
+      await edit(
+        ctx,
+        "Конфиг перенесён на новый сервер. Старый файл отозван и больше не подключится.",
+        new InlineKeyboard()
+          .text("Открыть конфиг", `uc|${config.id}`)
+          .row()
+          .text("Главное меню", "m")
+      );
+      await ctx.replyWithDocument(
+        new InputFile(file, `${safeFileName(config.displayName)}.ovpn`),
+        {
+          caption: `Новый файл «${config.displayName}». Срок действия сохранён: до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
+        }
+      );
+    } catch (error) {
+      logError(error);
+      await ctx.reply(
+        "Перенос не выполнен. Старый конфиг оставлен без изменений. Обратитесь к администратору.",
+        {
+          reply_markup: new InlineKeyboard().url(
+            "Связаться с администратором",
+            appConfig.contactUrl
+          ),
+        }
+      );
+    } finally {
+      operationLocks.delete(config.id);
+    }
+  });
+
+  bot.callbackQuery("a", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    pendingInputs.delete(String(ctx.from.id));
+    await ctx.answerCallbackQuery();
+    await showAdminMain(ctx, db, vpn);
+  });
+
+  bot.callbackQuery("as", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    pendingInputs.set(String(ctx.from.id), { kind: "search" });
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "Отправьте username пользователя или его числовой Telegram ID.",
+      new InlineKeyboard().text("Отмена", "a")
+    );
+  });
+
+  bot.callbackQuery(/^au\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const user = await db.getUserById(Number(ctx.match[1]));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery();
+    await showAdminUser(ctx, user, db);
+  });
+
+  bot.callbackQuery(/^ac\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery();
+    await showAdminConfig(ctx, config, db, appConfig);
+  });
+
+  bot.callbackQuery(/^ai\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const user = await db.getUserById(Number(ctx.match[1]));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery();
+    await showDateMenu(
+      ctx,
+      { kind: "issue", userId: user.id },
+      user.id,
+      appConfig.timezone
+    );
+  });
+
+  bot.callbackQuery(/^ae\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery();
+    await showDateMenu(
+      ctx,
+      { kind: "change", configId: config.id },
+      config.userId,
+      appConfig.timezone
+    );
+  });
+
+  bot.callbackQuery(/^dt\|([ibe])\|([^|]+)\|(30|60|90)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const target = decodeDateTarget(ctx.match[1]!, ctx.match[2]!);
+    if (!target) return showAlert(ctx, "Действие устарело.");
+    const expiresAt = expiryFromDate(
+      dateAfterDays(Number(ctx.match[3]), appConfig.timezone),
+      appConfig.timezone
+    )!;
+    await ctx.answerCallbackQuery({ text: "Выполняю…" });
+    await applyDateTarget(ctx, target, expiresAt, appConfig, db, configService);
+  });
+
+  bot.callbackQuery(/^dc\|([ibe])\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const target = decodeDateTarget(ctx.match[1]!, ctx.match[2]!);
+    if (!target) return showAlert(ctx, "Действие устарело.");
+    pendingInputs.set(String(ctx.from.id), { kind: "date", target });
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "Отправьте дату окончания в формате ГГГГ-ММ-ДД, например 2026-12-31.",
+      new InlineKeyboard().text("Отмена", "a")
+    );
+  });
+
+  bot.callbackQuery(/^ab\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const user = await db.getUserById(Number(ctx.match[1]));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    if (!vpn.isConfigured("old"))
+      return showAlert(ctx, "Старый сервер пока не подключён.");
+    await ctx.answerCallbackQuery({ text: "Обновляю список…" });
+    try {
+      const names = await vpn.listClients("old");
+      await db.syncLegacyClients("old", names);
+      const clients = await db.listUnassignedLegacyClients("old");
+      await showLegacyClients(ctx, user.id, clients);
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Не удалось прочитать список клиентов старого сервера.", {
+        reply_markup: new InlineKeyboard().text("Назад", `au|${user.id}`),
+      });
+    }
+  });
+
+  bot.callbackQuery(/^abl\|(\d+)\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const userId = Number(ctx.match[1]);
+    const legacyId = Number(ctx.match[2]);
+    const [user, legacy] = await Promise.all([db.getUserById(userId), db.getLegacyClient(legacyId)]);
+    if (!user || !legacy)
+      return showAlert(ctx, "Запись не найдена.");
+    await ctx.answerCallbackQuery();
+    await showDateMenu(
+      ctx,
+      { kind: "bind", userId, legacyId },
+      userId,
+      appConfig.timezone
+    );
+  });
+
+  bot.callbackQuery(/^ar\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `Отозвать «${config.displayName}»? Файл сразу перестанет подключаться и исчезнет у пользователя.`,
+      new InlineKeyboard()
+        .text("Подтвердить отзыв", `arc|${config.id}`)
+        .row()
+        .text("Отмена", `ac|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^arc\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг уже отозван.");
+    if (operationLocks.has(config.id))
+      return showAlert(ctx, "Операция уже выполняется.");
+    operationLocks.add(config.id);
+    await ctx.answerCallbackQuery({ text: "Отзываю…" });
+    try {
+      await configService.revoke(config);
+      const user = await db.getUserById(config.userId);
+      if (user) {
+        await bot.api
+          .sendMessage(
+            user.telegramId,
+            `Конфиг «${config.displayName}» отозван администратором.`
+          )
+          .catch(logError);
+      }
+      await edit(
+        ctx,
+        "Конфиг отозван.",
+        new InlineKeyboard()
+          .text("К пользователю", `au|${config.userId}`)
+          .row()
+          .text("Админ-панель", "a")
+      );
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Не удалось отозвать конфиг. Запись не изменена.", {
+        reply_markup: new InlineKeyboard()
+          .text("Повторить", `ar|${config.id}`)
+          .row()
+          .text("Назад", `ac|${config.id}`),
+      });
+    } finally {
+      operationLocks.delete(config.id);
+    }
+  });
+
+  return { bot };
+}
+
+function mainKeyboard(admin: boolean, contactUrl: string): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
+    .text("Мои конфиги", "ul")
+    .row()
+    .url("Оплатить или продлить", contactUrl);
+  if (admin) keyboard.row().text("Админ-панель", "a");
+  return keyboard;
+}
+
+function backToMainKeyboard(): InlineKeyboard {
+  return new InlineKeyboard().text("Главное меню", "m");
+}
+
+function usersKeyboard(users: UserRecord[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const user of users)
+    keyboard.text(userLabel(user), `au|${user.id}`).row();
+  return keyboard.text("Новый поиск", "as").row().text("Админ-панель", "a");
+}
+
+async function showUserConfig(
+  ctx: Context,
+  config: VpnConfigRecord,
+  appConfig: AppConfig
+): Promise<void> {
+  const expired = isExpired(config.expiresAt) || config.status === "expired";
+  const status = expired ? "Просрочен" : "Активен";
+  const keyboard = new InlineKeyboard()
+    .text("Переименовать", `rn|${config.id}`)
+    .row();
+  if (expired) {
+    keyboard.url("Продлить", appConfig.contactUrl).row();
+  } else if (config.isLegacy) {
+    keyboard.text("Получить файл", `lm|${config.id}`).row();
+  } else {
+    keyboard.text("Получить файл", `dl|${config.id}`).row();
+  }
+  keyboard.text("Назад", "ul").text("Главное меню", "m");
+  await edit(
+    ctx,
+    `Конфиг: ${config.displayName}\nСтатус: ${status}\nДействует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
+    keyboard
+  );
+}
+
+async function showAdminMain(
+  ctx: Context,
+  db: AppDatabase,
+  vpn: OpenVpnGateway
+): Promise<void> {
+  const stats = await db.stats();
+  const trafficLines = await Promise.all(
+    (["new", "old"] as const).map(async (key) => {
+      if (!vpn.isConfigured(key)) return `${vpn.serverName(key)}: не подключён`;
+      try {
+        const traffic = await vpn.traffic(key);
+        return `${vpn.serverName(key)}: ↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)}`;
+      } catch {
+        return `${vpn.serverName(key)}: статистика недоступна`;
+      }
+    })
+  );
+
+  const text = [
+    "Админ-панель",
+    "",
+    `Пользователей: ${stats.users}`,
+    `Активных конфигов: ${stats.active}`,
+    `Просроченных в меню: ${stats.expired}`,
+    `На новом сервере: ${stats.new}`,
+    `На старом сервере: ${stats.old}`,
+    "",
+    "VPN-трафик по счётчикам сервера:",
+    ...trafficLines,
+  ].join("\n");
+  await edit(
+    ctx,
+    text,
+    new InlineKeyboard()
+      .text("Найти пользователя", "as")
+      .row()
+      .text("Главное меню", "m")
+  );
+}
+
+async function showAdminUser(
+  ctx: Context,
+  user: UserRecord,
+  db: AppDatabase
+): Promise<void> {
+  const configs = await db.listConfigsForUserAdmin(user.id);
+  const keyboard = new InlineKeyboard();
+  for (const config of configs.slice(0, 30))
+    keyboard
+      .text(`${statusIcon(config)} ${config.displayName}`, `ac|${config.id}`)
+      .row();
+  keyboard.text("Выдать новый конфиг", `ai|${user.id}`).row();
+  keyboard.text("Привязать старый конфиг", `ab|${user.id}`).row();
+  keyboard.text("Новый поиск", "as").text("Админ-панель", "a");
+  await edit(
+    ctx,
+    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}`,
+    keyboard
+  );
+}
+
+async function showAdminConfig(
+  ctx: Context,
+  config: VpnConfigRecord,
+  db: AppDatabase,
+  appConfig: AppConfig
+): Promise<void> {
+  const user = (await db.getUserById(config.userId))!;
+  const expired = isExpired(config.expiresAt) || config.status === "expired";
+  const text = [
+    `Конфиг: ${config.displayName}`,
+    `Пользователь: ${userLabel(user)}`,
+    `Статус: ${expired ? "Просрочен" : "Активен"}`,
+    `Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
+    `Сервер: ${config.serverKey === "old" ? "старый" : "новый"}`,
+    `OpenVPN-клиент: ${config.clientName}`,
+  ].join("\n");
+  await edit(
+    ctx,
+    text,
+    new InlineKeyboard()
+      .text(expired ? "Продлить" : "Изменить срок", `ae|${config.id}`)
+      .row()
+      .text("Отозвать", `ar|${config.id}`)
+      .row()
+      .text("К пользователю", `au|${config.userId}`)
+      .text("Админ-панель", "a")
+  );
+}
+
+async function showDateMenu(
+  ctx: Context,
+  target: DateTarget,
+  backUserId: number,
+  timezone: string
+): Promise<void> {
+  const { code, value } = encodeDateTarget(target);
+  await edit(
+    ctx,
+    `Выберите дату окончания. Быстрые варианты считаются от сегодняшней даты (${DateTime.now().setZone(timezone).toFormat("dd.MM.yyyy")}).`,
+    new InlineKeyboard()
+      .text("+30 дней", `dt|${code}|${value}|30`)
+      .text("+60 дней", `dt|${code}|${value}|60`)
+      .text("+90 дней", `dt|${code}|${value}|90`)
+      .row()
+      .text("Указать дату", `dc|${code}|${value}`)
+      .row()
+      .text("Назад", `au|${backUserId}`)
+  );
+}
+
+async function showLegacyClients(
+  ctx: Context,
+  userId: number,
+  clients: LegacyClientRecord[]
+): Promise<void> {
+  const keyboard = new InlineKeyboard();
+  for (const client of clients.slice(0, 40))
+    keyboard.text(client.clientName, `abl|${userId}|${client.id}`).row();
+  keyboard.text("Назад", `au|${userId}`);
+  await edit(
+    ctx,
+    clients.length
+      ? "Выберите существующий OpenVPN-клиент:"
+      : "Непривязанных клиентов на старом сервере нет.",
+    keyboard
+  );
+}
+
+async function applyDateTarget(
+  ctx: Context,
+  target: DateTarget,
+  expiresAt: string,
+  appConfig: AppConfig,
+  db: AppDatabase,
+  service: ConfigService
+): Promise<void> {
+  const lockKey =
+    target.kind === "issue"
+      ? `issue:${target.userId}`
+      : target.kind === "bind"
+        ? `bind:${target.legacyId}`
+        : target.configId;
+  if (operationLocks.has(lockKey)) {
+    await ctx.reply("Эта операция уже выполняется.");
+    return;
+  }
+  operationLocks.add(lockKey);
+  try {
+    if (target.kind === "issue") {
+      const user = await db.getUserById(target.userId);
+      if (!user) throw new Error("Пользователь не найден");
+      const config = await service.issue(user, expiresAt);
+      await notifyConfigReady(
+        ctx,
+        user,
+        config,
+        appConfig,
+        "Новый конфиг готов."
+      );
+      await respond(
+        ctx,
+        `Конфиг «${config.displayName}» выдан пользователю ${userLabel(user)}.`,
+        new InlineKeyboard()
+          .text("Открыть конфиг", `ac|${config.id}`)
+          .row()
+          .text("К пользователю", `au|${user.id}`)
+      );
+      return;
+    }
+
+    if (target.kind === "bind") {
+      const [user, legacy] = await Promise.all([
+        db.getUserById(target.userId),
+        db.getLegacyClient(target.legacyId),
+      ]);
+      if (!user || !legacy)
+        throw new Error("Пользователь или клиент не найден");
+      const config = await service.bindLegacy(user, legacy, expiresAt);
+      await notifyConfigReady(
+        ctx,
+        user,
+        config,
+        appConfig,
+        "Существующий конфиг добавлен в Ваш кабинет."
+      );
+      await respond(
+        ctx,
+        `Клиент «${legacy.clientName}» привязан к ${userLabel(user)}.`,
+        new InlineKeyboard()
+          .text("Открыть конфиг", `ac|${config.id}`)
+          .row()
+          .text("К пользователю", `au|${user.id}`)
+      );
+      return;
+    }
+
+    const config = await db.getConfig(target.configId);
+    if (!config || config.status === "revoked")
+      throw new Error("Конфиг не найден");
+    const updated = await service.changeExpiry(config, expiresAt);
+    const user = await db.getUserById(updated.userId);
+    if (user)
+      await notifyConfigReady(
+        ctx,
+        user,
+        updated,
+        appConfig,
+        "Срок действия конфига изменён."
+      );
+    await respond(
+      ctx,
+      `Новый срок для «${updated.displayName}»: ${formatDate(expiresAt, appConfig.timezone)}.`,
+      new InlineKeyboard()
+        .text("Открыть конфиг", `ac|${updated.id}`)
+        .row()
+        .text("К пользователю", `au|${updated.userId}`)
+    );
+  } catch (error) {
+    logError(error);
+    await respond(
+      ctx,
+      "Операцию выполнить не удалось. Данные не были изменены.",
+      new InlineKeyboard().text("Админ-панель", "a")
+    );
+  } finally {
+    operationLocks.delete(lockKey);
+  }
+}
+
+async function notifyConfigReady(
+  ctx: Context,
+  user: UserRecord,
+  config: VpnConfigRecord,
+  appConfig: AppConfig,
+  prefix: string
+): Promise<void> {
+  await ctx.api
+    .sendMessage(
+      user.telegramId,
+      `${prefix}\n«${config.displayName}» действует до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
+      {
+        reply_markup: new InlineKeyboard()
+          .text("Открыть конфиг", `uc|${config.id}`)
+          .row()
+          .text("Главное меню", "m"),
+      }
+    )
+    .catch(logError);
+}
+
+async function ownedConfig(
+  ctx: Context,
+  db: AppDatabase,
+  configId: string
+): Promise<VpnConfigRecord | null> {
+  if (!ctx.from) return null;
+  const [user, config] = await Promise.all([
+    db.getUserByTelegramId(String(ctx.from.id)),
+    db.getConfig(configId),
+  ]);
+  return user &&
+    config &&
+    user.id === config.userId &&
+    config.status !== "revoked"
+    ? config
+    : null;
+}
+
+function statusIcon(config: VpnConfigRecord): string {
+  return isExpired(config.expiresAt) || config.status === "expired"
+    ? "🔴"
+    : "🟢";
+}
+
+function userLabel(user: UserRecord): string {
+  return user.username
+    ? `@${user.username} (${user.telegramId})`
+    : `${user.firstName} (${user.telegramId})`;
+}
+
+function isAdmin(ctx: Context, config: AppConfig): boolean {
+  return String(ctx.from?.id ?? "") === config.adminTelegramId;
+}
+
+function normalizeDisplayName(value: string): string | null {
+  const name = value.replace(/\s+/g, " ").trim();
+  return name.length >= 1 && name.length <= 40 ? name : null;
+}
+
+function safeFileName(value: string): string {
+  const safe = value
+    .replace(/[^\p{L}\p{N}._-]+/gu, "_")
+    .replace(/^_+|_+$/g, "");
+  return safe.slice(0, 50) || "vpn-config";
+}
+
+function parseFutureDate(value: string, timezone: string): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value.trim())) return null;
+  const date = DateTime.fromFormat(value.trim(), "yyyy-MM-dd", {
+    zone: timezone,
+  });
+  if (
+    !date.isValid ||
+    date.startOf("day") < DateTime.now().setZone(timezone).startOf("day")
+  )
+    return null;
+  return expiryFromDate(value.trim(), timezone);
+}
+
+function encodeDateTarget(target: DateTarget): {
+  code: "i" | "b" | "e";
+  value: string;
+} {
+  if (target.kind === "issue")
+    return { code: "i", value: String(target.userId) };
+  if (target.kind === "bind")
+    return { code: "b", value: `${target.userId}.${target.legacyId}` };
+  return { code: "e", value: target.configId };
+}
+
+function decodeDateTarget(code: string, value: string): DateTarget | null {
+  if (code === "i" && /^\d+$/.test(value))
+    return { kind: "issue", userId: Number(value) };
+  if (code === "b" && /^\d+\.\d+$/.test(value)) {
+    const [userId, legacyId] = value.split(".").map(Number);
+    return { kind: "bind", userId: userId!, legacyId: legacyId! };
+  }
+  if (code === "e" && /^[0-9a-f-]{36}$/.test(value))
+    return { kind: "change", configId: value };
+  return null;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б`;
+  const units = ["КБ", "МБ", "ГБ", "ТБ"];
+  let value = bytes;
+  let unit = "Б";
+  for (const candidate of units) {
+    value /= 1024;
+    unit = candidate;
+    if (value < 1024) break;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${unit}`;
+}
+
+async function edit(
+  ctx: Context,
+  text: string,
+  keyboard: InlineKeyboard
+): Promise<void> {
+  try {
+    await ctx.editMessageText(text, { reply_markup: keyboard });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("message is not modified"))
+      await ctx.reply(text, { reply_markup: keyboard });
+  }
+}
+
+async function respond(
+  ctx: Context,
+  text: string,
+  keyboard: InlineKeyboard
+): Promise<void> {
+  if (ctx.callbackQuery?.message) {
+    await edit(ctx, text, keyboard);
+  } else {
+    await ctx.reply(text, { reply_markup: keyboard });
+  }
+}
+
+async function showAlert(ctx: Context, text: string): Promise<void> {
+  await ctx.answerCallbackQuery({ text, show_alert: true });
+}
+
+function logError(error: unknown): void {
+  console.error(error);
+}
