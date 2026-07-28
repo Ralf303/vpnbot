@@ -66,11 +66,16 @@ export class BackgroundJobs {
         try {
           await this.bot.api.sendMessage(
             user.telegramId,
-            `Срок действия конфига «${config.displayName}» закончится через ${days} ${dayWord(days)} — ${formatDate(config.expiresAt, this.config.timezone)}. Для продления свяжитесь с администратором.`,
+            `⚠️ Срок действия конфига «${config.displayName}» закончится через ${days} ${dayWord(days)} — ${formatDate(config.expiresAt, this.config.timezone)}.\n\n💳 Для продления оплатите подписку и после оплаты сообщите администратору.`,
             {
               reply_markup: {
                 inline_keyboard: [
-                  [{ text: "Продлить", url: this.config.contactUrl }],
+                  [
+                    {
+                      text: "💬 Сообщить об оплате",
+                      url: this.config.contactUrl,
+                    },
+                  ],
                 ],
               },
             }
