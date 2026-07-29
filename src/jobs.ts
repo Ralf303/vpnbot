@@ -3,6 +3,7 @@ import cron, { type ScheduledTask } from "node-cron";
 import { DateTime } from "luxon";
 import type { AppConfig } from "./config.js";
 import { AppDatabase } from "./database.js";
+import type { UserRecord, VpnConfigRecord } from "./domain.js";
 import { OpenVpnGateway } from "./openvpn.js";
 import { daysUntilExpiry, formatDate, isRevocationDue } from "./time.js";
 import { TrafficService } from "./traffic-service.js";
@@ -53,6 +54,18 @@ export class BackgroundJobs {
     this.remindersRunning = true;
     try {
       const localDate = now.setZone(this.config.timezone).toISODate()!;
+      const remindersByUser = new Map<
+        string,
+        {
+          user: UserRecord;
+          items: Array<{
+            config: VpnConfigRecord;
+            days: number;
+            kind: string;
+          }>;
+        }
+      >();
+
       for (const { config, user } of await this.db.listReminderCandidates()) {
         const days = daysUntilExpiry(
           config.expiresAt,
@@ -63,10 +76,30 @@ export class BackgroundJobs {
         const kind = `expires_${days}`;
         if (await this.db.notificationWasSent(config.id, kind, localDate)) continue;
 
+        const batch = remindersByUser.get(user.telegramId) ?? {
+          user,
+          items: [],
+        };
+        batch.items.push({ config, days, kind });
+        remindersByUser.set(user.telegramId, batch);
+      }
+
+      for (const { user, items } of remindersByUser.values()) {
+        items.sort((left, right) =>
+          left.config.expiresAt.localeCompare(right.config.expiresAt)
+        );
+        const heading = items.length === 1
+          ? "⚠️ Скоро закончится срок действия VPN-конфига:"
+          : "⚠️ Скоро закончится срок действия нескольких VPN-конфигов:";
+        const lines = items.map(
+          ({ config, days }) =>
+            `• «${config.displayName}» — через ${days} ${dayWord(days)}, до ${formatDate(config.expiresAt, this.config.timezone)}`
+        );
+
         try {
           await this.bot.api.sendMessage(
             user.telegramId,
-            `⚠️ Срок действия конфига «${config.displayName}» закончится через ${days} ${dayWord(days)} — ${formatDate(config.expiresAt, this.config.timezone)}.\n\n💳 Для продления оплатите подписку и после оплаты сообщите администратору.`,
+            `${heading}\n\n${lines.join("\n")}\n\n💳 Для продления оплатите подписку и после оплаты сообщите администратору.`,
             {
               reply_markup: {
                 inline_keyboard: [
@@ -80,7 +113,10 @@ export class BackgroundJobs {
               },
             }
           );
-          await this.db.markNotificationSent(config.id, kind, localDate);
+          await this.db.markNotificationsSent(
+            items.map(({ config, kind }) => ({ configId: config.id, kind })),
+            localDate
+          );
         } catch (error) {
           console.error(
             `Не удалось отправить напоминание пользователю ${user.telegramId}`,

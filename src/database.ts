@@ -343,11 +343,18 @@ export class AppDatabase {
     }));
   }
 
-  async markNotificationSent(configId: string, kind: string, localDate: string): Promise<void> {
-    await this.prisma.notification.upsert({
-      where: { configId_kind_localDate: { configId, kind, localDate } },
-      create: { configId, kind, localDate },
-      update: {},
+  async markNotificationsSent(
+    items: Array<{ configId: string; kind: string }>,
+    localDate: string
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      for (const { configId, kind } of items) {
+        await tx.notification.upsert({
+          where: { configId_kind_localDate: { configId, kind, localDate } },
+          create: { configId, kind, localDate },
+          update: {},
+        });
+      }
     });
   }
 

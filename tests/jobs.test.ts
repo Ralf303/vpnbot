@@ -1,0 +1,106 @@
+import { randomUUID } from "node:crypto";
+import type { Bot } from "grammy";
+import { DateTime } from "luxon";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AppConfig } from "../src/config.js";
+import { AppDatabase } from "../src/database.js";
+import type { VpnConfigRecord } from "../src/domain.js";
+import { BackgroundJobs } from "../src/jobs.js";
+import type { OpenVpnGateway } from "../src/openvpn.js";
+import { expiryFromDate, hiddenAtFromExpiry } from "../src/time.js";
+import type { TrafficService } from "../src/traffic-service.js";
+import { createCleanDatabase } from "./database-fixture.js";
+
+const appConfig: AppConfig = {
+  botToken: "test",
+  adminTelegramId: "1",
+  contactUrl: "https://t.me/ralfy",
+  databaseUrl: "test",
+  timezone: "Europe/Moscow",
+  reminderHour: 10,
+  servers: {},
+};
+
+let db: AppDatabase;
+
+beforeEach(async () => {
+  db = await createCleanDatabase();
+});
+
+afterEach(async () => {
+  await db.close();
+});
+
+describe("напоминания об окончании", () => {
+  it("объединяет несколько конфигов пользователя в одно сообщение", async () => {
+    const user = await db.upsertUser({ telegramId: "200", firstName: "Иван" });
+    const first = reminderConfig(user.id, "Телефон", "reminder_phone", "2026-08-01");
+    const second = reminderConfig(user.id, "Ноутбук", "reminder_laptop", "2026-07-31");
+    await db.insertConfig(first);
+    await db.insertConfig(second);
+
+    const sendMessage = vi.fn(
+      async (
+        _chatId: string,
+        _text: string,
+        _options: {
+          reply_markup: {
+            inline_keyboard: Array<Array<{ url?: string }>>;
+          };
+        }
+      ) => ({})
+    );
+    const jobs = new BackgroundJobs(
+      { api: { sendMessage } } as unknown as Bot,
+      db,
+      {} as OpenVpnGateway,
+      appConfig,
+      {} as TrafficService
+    );
+    const now = DateTime.fromISO("2026-07-29T10:00:00", {
+      zone: appConfig.timezone,
+    });
+
+    await jobs.sendReminders(now);
+    await jobs.sendReminders(now);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const [telegramId, text, options] = sendMessage.mock.calls[0]!;
+    expect(telegramId).toBe(user.telegramId);
+    expect(text).toContain("нескольких VPN-конфигов");
+    expect(text).toContain("«Телефон» — через 3 дня");
+    expect(text).toContain("«Ноутбук» — через 2 дня");
+    expect(options.reply_markup.inline_keyboard[0]![0]!.url)
+      .toBe(appConfig.contactUrl);
+    await expect(
+      db.notificationWasSent(first.id, "expires_3", "2026-07-29")
+    ).resolves.toBe(true);
+    await expect(
+      db.notificationWasSent(second.id, "expires_2", "2026-07-29")
+    ).resolves.toBe(true);
+  });
+});
+
+function reminderConfig(
+  userId: number,
+  displayName: string,
+  clientName: string,
+  expiryDate: string
+): VpnConfigRecord {
+  const expiresAt = expiryFromDate(expiryDate, appConfig.timezone)!;
+  const now = new Date().toISOString();
+  return {
+    id: randomUUID(),
+    userId,
+    displayName,
+    clientName,
+    serverKey: "new",
+    expiresAt,
+    status: "active",
+    isLegacy: false,
+    revokedAt: null,
+    hiddenAt: hiddenAtFromExpiry(expiresAt),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
