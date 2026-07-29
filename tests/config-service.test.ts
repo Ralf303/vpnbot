@@ -118,4 +118,41 @@ describe("ConfigService", () => {
     await expect(service.download(config)).resolves.toBeInstanceOf(Buffer);
     expect(vpn.calls.at(-1)).toBe("download:old:legacy_download");
   });
+
+  it("пересоздаёт конфиг на менее загруженном сервере и сохраняет данные", async () => {
+    const user = await db.upsertUser({ telegramId: "105", firstName: "Сергей" });
+    const original = await service.issue(user, "2027-03-01T20:59:59.999Z");
+    await db.updateDisplayName(original.id, "Рабочий компьютер");
+    const renamed = (await db.getConfig(original.id))!;
+
+    const recreated = await service.recreate(renamed);
+
+    expect(recreated.config.id).toBe(original.id);
+    expect(recreated.config.displayName).toBe("Рабочий компьютер");
+    expect(recreated.config.expiresAt).toBe(original.expiresAt);
+    expect(recreated.config.serverKey).toBe("old");
+    expect(recreated.config.clientName).not.toBe(original.clientName);
+    expect(vpn.calls).toContain(`revoke:new:${original.clientName}`);
+    expect(recreated.file).toBeInstanceOf(Buffer);
+  });
+
+  it("оставляет старый конфиг при ошибке его отзыва во время пересоздания", async () => {
+    const user = await db.upsertUser({ telegramId: "106", firstName: "Елена" });
+    await db.syncLegacyClients("old", ["legacy_recreate"]);
+    const legacy = (await db.listUnassignedLegacyClients("old"))[0]!;
+    const original = await service.bindLegacy(
+      user,
+      legacy,
+      "2027-04-01T20:59:59.999Z"
+    );
+    vpn.failOldRevoke = true;
+
+    await expect(service.recreate(original)).rejects.toThrow("old unavailable");
+
+    const restored = (await db.getConfig(original.id))!;
+    expect(restored.clientName).toBe(original.clientName);
+    expect(restored.serverKey).toBe("old");
+    expect(restored.isLegacy).toBe(true);
+    expect(vpn.calls.filter((call) => call.startsWith("revoke:new:"))).toHaveLength(1);
+  });
 });

@@ -228,24 +228,24 @@ export class AppDatabase {
     });
   }
 
-  async restoreLegacyClient(id: string, clientName: string, expiresAt: string, hiddenAt: string): Promise<void> {
+  async restoreClient(config: VpnConfigRecord): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.vpnConfig.update({
-        where: { id },
+        where: { id: config.id },
         data: {
-          clientName,
-          serverKey: "old",
-          isLegacy: true,
-          expiresAt: new Date(expiresAt),
-          hiddenAt: new Date(hiddenAt),
-          status: "active",
-          revokedAt: null,
+          clientName: config.clientName,
+          serverKey: config.serverKey,
+          isLegacy: config.isLegacy,
+          expiresAt: new Date(config.expiresAt),
+          hiddenAt: new Date(config.hiddenAt),
+          status: config.status,
+          revokedAt: config.revokedAt ? new Date(config.revokedAt) : null,
         },
       });
       await tx.clientName.upsert({
-        where: { name: clientName },
-        create: { name: clientName, configId: id },
-        update: { configId: id },
+        where: { name: config.clientName },
+        create: { name: config.clientName, configId: config.id },
+        update: { configId: config.id },
       });
     });
   }

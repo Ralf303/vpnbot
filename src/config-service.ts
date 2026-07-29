@@ -134,12 +134,7 @@ export class ConfigService {
       await this.vpn.revokeClient("old", config.clientName);
       return { file, clientName: newClientName };
     } catch (error) {
-      await this.db.restoreLegacyClient(
-        config.id,
-        config.clientName,
-        config.expiresAt,
-        config.hiddenAt
-      );
+      await this.db.restoreClient(config);
       await this.vpn
         .revokeClient("new", newClientName)
         .catch((rollbackError: unknown) => {
@@ -185,6 +180,58 @@ export class ConfigService {
       await this.db.updateExpiry(config.id, expiresAt, hiddenAt);
     }
     return (await this.db.getConfig(config.id))!;
+  }
+
+  async recreate(config: VpnConfigRecord): Promise<{
+    config: VpnConfigRecord;
+    file: Buffer;
+  }> {
+    if (config.status !== "active" || isExpired(config.expiresAt)) {
+      throw new Error("Срок действия конфига истёк");
+    }
+
+    const serverKey = await this.selectIssueServer();
+    const { clientName: newClientName, file } =
+      await this.createUniqueClient(serverKey);
+    try {
+      await this.db.replaceClient(
+        config.id,
+        newClientName,
+        serverKey,
+        config.expiresAt,
+        config.hiddenAt
+      );
+    } catch (error) {
+      await this.vpn
+        .revokeClient(serverKey, newClientName)
+        .catch((rollbackError: unknown) => {
+          console.error(
+            "Не удалось отозвать новый клиент после ошибки пересоздания",
+            rollbackError
+          );
+        });
+      throw error;
+    }
+
+    try {
+      await this.vpn.revokeClient(config.serverKey, config.clientName);
+    } catch (error) {
+      await this.db.restoreClient(config);
+      await this.vpn
+        .revokeClient(serverKey, newClientName)
+        .catch((rollbackError: unknown) => {
+          console.error(
+            "Не удалось отозвать новый клиент после отката пересоздания",
+            rollbackError
+          );
+        });
+      throw error;
+    }
+
+    return {
+      config: (await this.db.getConfig(config.id))!,
+      file,
+    };
   }
 
   async revoke(config: VpnConfigRecord): Promise<void> {

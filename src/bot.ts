@@ -323,6 +323,82 @@ export function createBot(
     }
   });
 
+  bot.callbackQuery(/^rr\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Просроченный конфиг нельзя пересоздать.");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `🔄 Пересоздать конфиг «${config.displayName}»?\n\nБудет создан новый файл на менее загруженном доступном сервере. Текущий файл сразу перестанет подключаться. Название и срок действия сохранятся.`,
+      new InlineKeyboard()
+        .text("✅ Пересоздать", `rrc|${config.id}`)
+        .row()
+        .text("❌ Отмена", `uc|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^rrc\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Просроченный конфиг нельзя пересоздать.");
+    if (operationLocks.has(config.id))
+      return showAlert(ctx, "Пересоздание уже выполняется.");
+
+    operationLocks.add(config.id);
+    await ctx.answerCallbackQuery({ text: "Пересоздаю конфиг…" });
+    try {
+      const recreated = await configService.recreate(config);
+      try {
+        await edit(
+          ctx,
+          `✅ Конфиг «${recreated.config.displayName}» пересоздан. Старый файл больше не подключится.`,
+          new InlineKeyboard()
+            .text("🔎 Открыть конфиг", `uc|${recreated.config.id}`)
+            .row()
+            .text("🏠 Главное меню", "m")
+        );
+        await ctx.replyWithDocument(
+          new InputFile(
+            recreated.file,
+            vpnFileName(recreated.config.clientName)
+          ),
+          {
+            caption: `🔐 Новый файл для «${recreated.config.displayName}». Действует до ${formatDate(recreated.config.expiresAt, appConfig.timezone)}.`,
+          }
+        );
+      } catch (deliveryError) {
+        logError(deliveryError);
+        await ctx
+          .reply(
+            "Конфиг пересоздан, но отправить файл не удалось. Откройте конфиг и нажмите «Получить файл».",
+            {
+              reply_markup: new InlineKeyboard().text(
+                "🔎 Открыть конфиг",
+                `uc|${recreated.config.id}`
+              ),
+            }
+          )
+          .catch(logError);
+      }
+    } catch (error) {
+      logError(error);
+      await ctx.reply(
+        "Пересоздание не выполнено. Текущий конфиг оставлен без изменений. Попробуйте позднее или свяжитесь с администратором.",
+        {
+          reply_markup: new InlineKeyboard()
+            .url("Связаться с администратором", appConfig.contactUrl)
+            .row()
+            .text("Назад", `uc|${config.id}`),
+        }
+      );
+    } finally {
+      operationLocks.delete(config.id);
+    }
+  });
+
   bot.callbackQuery(/^lm\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
@@ -577,7 +653,11 @@ async function showUserConfig(
   if (expired) {
     keyboard.url("💳 Продлить", appConfig.contactUrl).row();
   } else {
-    keyboard.text("📥 Получить файл", `dl|${config.id}`).row();
+    keyboard
+      .text("📥 Получить файл", `dl|${config.id}`)
+      .row()
+      .text("🔄 Пересоздать конфиг", `rr|${config.id}`)
+      .row();
   }
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");
   await edit(
