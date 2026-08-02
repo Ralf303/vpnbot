@@ -91,7 +91,14 @@ export class TrafficService {
 
   private async snapshot(serverKey: ServerKey): Promise<TrafficSnapshot> {
     const snapshot = await this.vpn.trafficSessions(serverKey);
-    await this.db.importTrafficEvents(serverKey, snapshot.completed);
+    try {
+      await this.db.importTrafficEvents(serverKey, snapshot.completed);
+    } catch (error) {
+      console.error(
+        `Не удалось импортировать историю трафика сервера ${serverKey}`,
+        error
+      );
+    }
     return snapshot;
   }
 }

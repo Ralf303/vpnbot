@@ -255,32 +255,46 @@ export class AppDatabase {
     events: CompletedTrafficSession[]
   ): Promise<void> {
     if (events.length === 0) return;
-    await this.prisma.$transaction(async (tx) => {
-      for (const event of events) {
-        const name = await tx.clientName.findUnique({
-          where: { name: event.clientName },
-          select: { configId: true },
-        });
-        await tx.trafficEvent.upsert({
-          where: {
-            serverKey_eventId: { serverKey, eventId: event.eventId },
-          },
-          create: {
+    const storedCount = await this.prisma.trafficEvent.count({
+      where: { serverKey },
+    });
+    if (storedCount !== events.length) {
+      const clientNames = [...new Set(events.map((event) => event.clientName))];
+      const mappings = await this.prisma.clientName.findMany({
+        where: { name: { in: clientNames } },
+        select: { name: true, configId: true },
+      });
+      const configByClient = new Map(
+        mappings.map(({ name, configId }) => [name, configId])
+      );
+      const batchSize = 500;
+      for (let offset = 0; offset < events.length; offset += batchSize) {
+        const batch = events.slice(offset, offset + batchSize);
+        await this.prisma.trafficEvent.createMany({
+          data: batch.map((event) => ({
             serverKey,
             eventId: event.eventId,
-            configId: name?.configId ?? null,
+            configId: configByClient.get(event.clientName) ?? null,
             clientName: event.clientName,
             uploadBytes: BigInt(event.uploadBytes),
             downloadBytes: BigInt(event.downloadBytes),
             connectedAt: new Date(event.connectedAt * 1000),
             disconnectedAt: new Date(event.disconnectedAt * 1000),
-          },
-          update: {
-            ...(name?.configId ? { configId: name.configId } : {}),
-          },
+          })),
+          skipDuplicates: true,
         });
       }
-    });
+    }
+
+    await this.prisma.$executeRaw`
+      UPDATE "traffic_events" AS events
+      SET "config_id" = names."config_id"
+      FROM "client_names" AS names
+      WHERE events."server_key" = CAST(${serverKey} AS "ServerKey")
+        AND events."config_id" IS NULL
+        AND names."name" = events."client_name"
+        AND names."config_id" IS NOT NULL
+    `;
   }
 
   async trafficForConfig(configId: string): Promise<ServerTraffic> {
