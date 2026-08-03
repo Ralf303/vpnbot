@@ -13,6 +13,7 @@ import { createCleanDatabase } from "./database-fixture.js";
 
 class FakeTrafficGateway {
   snapshot: TrafficSnapshot = { active: [], completed: [] };
+  activeCalls = 0;
 
   isConfigured(serverKey: ServerKey): boolean {
     return serverKey === "new";
@@ -20,6 +21,11 @@ class FakeTrafficGateway {
 
   async trafficSessions(): Promise<TrafficSnapshot> {
     return this.snapshot;
+  }
+
+  async activeSessions(): Promise<TrafficSnapshot["active"]> {
+    this.activeCalls += 1;
+    return this.snapshot.active;
   }
 }
 
@@ -82,15 +88,21 @@ describe("TrafficService", () => {
       ],
     };
 
+    await service.syncAll();
+    await service.syncAll();
     expect(await service.forConfig(config)).toEqual({
       uploadBytes: 110,
       downloadBytes: 220,
       totalBytes: 330,
+      activeConnections: 1,
+      liveAvailable: true,
     });
     expect(await service.forConfig(config)).toEqual({
       uploadBytes: 110,
       downloadBytes: 220,
       totalBytes: 330,
+      activeConnections: 1,
+      liveAvailable: true,
     });
     expect(await db.prisma.trafficEvent.count()).toBe(1);
   });
@@ -129,11 +141,40 @@ describe("TrafficService", () => {
     vi.spyOn(db, "importTrafficEvents").mockRejectedValue(new Error("timeout"));
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
+    await service.syncAll();
     const totals = await service.all();
 
     expect(totals.servers.new.liveAvailable).toBe(true);
     expect(totals.servers.new.activeConnections).toBe(1);
     log.mockRestore();
+  });
+
+  it("получает подключения один раз для списка конфигов одного сервера", async () => {
+    gateway.snapshot.active = [
+      {
+        clientName: config.clientName,
+        connectedAt: 1200,
+        uploadBytes: 10,
+        downloadBytes: 20,
+      },
+    ];
+    const second = {
+      ...config,
+      id: randomUUID(),
+      clientName: "secondclient",
+    };
+
+    const states = await service.connectionStates([config, second]);
+
+    expect(states.get(config.id)).toEqual({
+      activeConnections: 1,
+      liveAvailable: true,
+    });
+    expect(states.get(second.id)).toEqual({
+      activeConnections: 0,
+      liveAvailable: true,
+    });
+    expect(gateway.activeCalls).toBe(1);
   });
 
   it("импортирует историю пакетами и не создаёт дубликаты", async () => {

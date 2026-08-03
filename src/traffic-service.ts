@@ -14,6 +14,16 @@ export interface ServerTrafficUsage extends TrafficUsage {
   liveAvailable: boolean;
 }
 
+export interface ConfigTrafficUsage extends TrafficUsage {
+  activeConnections: number;
+  liveAvailable: boolean;
+}
+
+export interface ConfigConnectionState {
+  activeConnections: number;
+  liveAvailable: boolean;
+}
+
 export interface AllTrafficUsage {
   total: TrafficUsage;
   servers: Record<ServerKey, ServerTrafficUsage>;
@@ -38,11 +48,13 @@ export class TrafficService {
     );
   }
 
-  async forConfig(config: VpnConfigRecord): Promise<TrafficUsage> {
+  async forConfig(config: VpnConfigRecord): Promise<ConfigTrafficUsage> {
     let active: ActiveTrafficSession[] = [];
+    let liveAvailable = false;
     try {
       if (this.vpn.isConfigured(config.serverKey)) {
-        active = (await this.snapshot(config.serverKey)).active;
+        active = await this.vpn.activeSessions(config.serverKey);
+        liveAvailable = true;
       }
     } catch (error) {
       console.error(`Не удалось получить активный трафик конфига ${config.id}`, error);
@@ -52,7 +64,59 @@ export class TrafficService {
       this.db.clientNamesForConfig(config.id),
     ]);
     const knownNames = new Set([...names, config.clientName]);
-    return usage(add(completed, sumActive(active, knownNames)));
+    const relevantActive = active.filter((session) =>
+      knownNames.has(session.clientName)
+    );
+    return {
+      ...usage(add(completed, sumActive(relevantActive))),
+      activeConnections: relevantActive.length,
+      liveAvailable,
+    };
+  }
+
+  async connectionStates(
+    configs: VpnConfigRecord[]
+  ): Promise<Map<string, ConfigConnectionState>> {
+    const activeCounts: Record<ServerKey, Map<string, number>> = {
+      new: new Map(),
+      old: new Map(),
+    };
+    const liveAvailable: Record<ServerKey, boolean> = {
+      new: false,
+      old: false,
+    };
+    const serverKeys = [...new Set(configs.map((config) => config.serverKey))];
+    await Promise.all(
+      serverKeys.map(async (serverKey) => {
+        if (!this.vpn.isConfigured(serverKey)) return;
+        try {
+          const sessions = await this.vpn.activeSessions(serverKey);
+          liveAvailable[serverKey] = true;
+          for (const session of sessions) {
+            activeCounts[serverKey].set(
+              session.clientName,
+              (activeCounts[serverKey].get(session.clientName) ?? 0) + 1
+            );
+          }
+        } catch (error) {
+          console.error(
+            `Не удалось получить подключения сервера ${serverKey}`,
+            error
+          );
+        }
+      })
+    );
+
+    return new Map(
+      configs.map((config) => [
+        config.id,
+        {
+          activeConnections:
+            activeCounts[config.serverKey].get(config.clientName) ?? 0,
+          liveAvailable: liveAvailable[config.serverKey],
+        },
+      ])
+    );
   }
 
   async all(): Promise<AllTrafficUsage> {
@@ -67,7 +131,7 @@ export class TrafficService {
     for (const serverKey of ["new", "old"] as const) {
       if (!this.vpn.isConfigured(serverKey)) continue;
       try {
-        activeByServer[serverKey] = (await this.snapshot(serverKey)).active;
+        activeByServer[serverKey] = await this.vpn.activeSessions(serverKey);
         liveAvailable[serverKey] = true;
       } catch (error) {
         console.error(`Не удалось получить активный трафик сервера ${serverKey}`, error);

@@ -85,46 +85,12 @@ export class OpenVpnGateway {
 
   async trafficSessions(serverKey: ServerKey): Promise<TrafficSnapshot> {
     const output = await this.execute(serverKey, ["traffic-sessions"]);
-    const active: ActiveTrafficSession[] = [];
-    const completed: CompletedTrafficSession[] = [];
-    for (const line of output.toString("utf8").split(/\r?\n/)) {
-      if (!line) continue;
-      const fields = line.split("\t");
-      if (fields[0] === "active" && fields.length === 5) {
-        const [, clientName, connectedAt, uploadBytes, downloadBytes] = fields;
-        if (!clientName || !CLIENT_NAME.test(clientName)) continue;
-        const parsed = parseTrafficNumbers(connectedAt, uploadBytes, downloadBytes);
-        if (!parsed) continue;
-        active.push({ clientName, ...parsed });
-      } else if (fields[0] === "completed" && fields.length === 7) {
-        const [
-          ,
-          eventId,
-          clientName,
-          connectedAt,
-          disconnectedAt,
-          uploadBytes,
-          downloadBytes,
-        ] = fields;
-        if (
-          !eventId ||
-          eventId.length > 160 ||
-          !clientName ||
-          !CLIENT_NAME.test(clientName)
-        ) continue;
-        const parsed = parseTrafficNumbers(connectedAt, uploadBytes, downloadBytes);
-        const disconnected = Number(disconnectedAt);
-        if (!parsed || !Number.isSafeInteger(disconnected) || disconnected < parsed.connectedAt)
-          continue;
-        completed.push({
-          eventId,
-          clientName,
-          ...parsed,
-          disconnectedAt: disconnected,
-        });
-      }
-    }
-    return { active, completed };
+    return parseTrafficSnapshot(output);
+  }
+
+  async activeSessions(serverKey: ServerKey): Promise<ActiveTrafficSession[]> {
+    const output = await this.execute(serverKey, ["active-sessions"]);
+    return parseTrafficSnapshot(output).active;
   }
 
   private async execute(serverKey: ServerKey, args: string[]): Promise<Buffer> {
@@ -194,6 +160,62 @@ export class OpenVpnGateway {
       });
     });
   }
+}
+
+function parseTrafficSnapshot(output: Buffer): TrafficSnapshot {
+  const active: ActiveTrafficSession[] = [];
+  const completed: CompletedTrafficSession[] = [];
+  for (const line of output.toString("utf8").split(/\r?\n/)) {
+    if (!line) continue;
+    const fields = line.split("\t");
+    if (fields[0] === "active" && fields.length === 5) {
+      const [, clientName, connectedAt, uploadBytes, downloadBytes] = fields;
+      if (!clientName || !CLIENT_NAME.test(clientName)) continue;
+      const parsed = parseTrafficNumbers(
+        connectedAt,
+        uploadBytes,
+        downloadBytes
+      );
+      if (!parsed) continue;
+      active.push({ clientName, ...parsed });
+    } else if (fields[0] === "completed" && fields.length === 7) {
+      const [
+        ,
+        eventId,
+        clientName,
+        connectedAt,
+        disconnectedAt,
+        uploadBytes,
+        downloadBytes,
+      ] = fields;
+      if (
+        !eventId ||
+        eventId.length > 160 ||
+        !clientName ||
+        !CLIENT_NAME.test(clientName)
+      )
+        continue;
+      const parsed = parseTrafficNumbers(
+        connectedAt,
+        uploadBytes,
+        downloadBytes
+      );
+      const disconnected = Number(disconnectedAt);
+      if (
+        !parsed ||
+        !Number.isSafeInteger(disconnected) ||
+        disconnected < parsed.connectedAt
+      )
+        continue;
+      completed.push({
+        eventId,
+        clientName,
+        ...parsed,
+        disconnectedAt: disconnected,
+      });
+    }
+  }
+  return { active, completed };
 }
 
 function parseTrafficNumbers(

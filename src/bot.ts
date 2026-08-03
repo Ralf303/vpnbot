@@ -10,7 +10,11 @@ import type {
 } from "./domain.js";
 import { OpenVpnGateway } from "./openvpn.js";
 import { vpnFileName } from "./file-name.js";
-import { TrafficService, type ServerTrafficUsage } from "./traffic-service.js";
+import {
+  TrafficService,
+  type ConfigConnectionState,
+  type ServerTrafficUsage,
+} from "./traffic-service.js";
 import {
   dateAfterDays,
   dateAfterMonths,
@@ -32,6 +36,7 @@ type PendingInput =
 
 const pendingInputs = new Map<string, PendingInput>();
 const operationLocks = new Set<string>();
+const CONFIG_PAGE_SIZE = 10;
 
 export interface BotApplication {
   bot: Bot;
@@ -254,22 +259,14 @@ export function createBot(
     await ctx.answerCallbackQuery();
     const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
     const configs = await db.listVisibleConfigs(user.id);
-    const keyboard = new InlineKeyboard();
-    for (const config of configs.slice(0, 40)) {
-      keyboard
-        .text(`${statusIcon(config)} ${config.displayName}`, `uc|${config.id}`)
-        .row();
-    }
-    keyboard.text("⬅️ Назад", "m");
-    const suffix =
-      configs.length > 40 ? "\n\nПоказаны первые 40 конфигов." : "";
-    await edit(
-      ctx,
-      configs.length
-        ? `🗂 Ваши конфиги:${suffix}`
-        : "📭 У Вас пока нет доступных конфигов.",
-      keyboard
-    );
+    await showUserConfigs(ctx, configs, 0, trafficService);
+  });
+
+  bot.callbackQuery(/^ulp\|(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
+    const configs = await db.listVisibleConfigs(user.id);
+    await showUserConfigs(ctx, configs, Number(ctx.match[1]), trafficService);
   });
 
   bot.callbackQuery(/^uc\|(.+)$/, async (ctx) => {
@@ -442,7 +439,21 @@ export function createBot(
     const user = await db.getUserById(Number(ctx.match[1]));
     if (!user) return showAlert(ctx, "Пользователь не найден.");
     await ctx.answerCallbackQuery();
-    await showAdminUser(ctx, user, db);
+    await showAdminUser(ctx, user, db, trafficService, 0);
+  });
+
+  bot.callbackQuery(/^aup\|(\d+)\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const user = await db.getUserById(Number(ctx.match[1]));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery();
+    await showAdminUser(
+      ctx,
+      user,
+      db,
+      trafficService,
+      Number(ctx.match[2])
+    );
   });
 
   bot.callbackQuery(/^ac\|(.+)$/, async (ctx) => {
@@ -638,6 +649,36 @@ function usersKeyboard(users: UserRecord[]): InlineKeyboard {
   return keyboard.text("🔎 Новый поиск", "as").row().text("🛠 Админ-панель", "a");
 }
 
+async function showUserConfigs(
+  ctx: Context,
+  configs: VpnConfigRecord[],
+  requestedPage: number,
+  trafficService: TrafficService
+): Promise<void> {
+  const { page, totalPages, items } = paginateConfigs(configs, requestedPage);
+  const connectionStates = await trafficService.connectionStates(items);
+  const keyboard = new InlineKeyboard();
+  for (const config of items) {
+    keyboard
+      .text(
+        configListLabel(config, connectionStates.get(config.id)),
+        `uc|${config.id}`
+      )
+      .row();
+  }
+  addPaginationRow(keyboard, page, totalPages, (targetPage) =>
+    `ulp|${targetPage}`
+  );
+  keyboard.text("⬅️ Назад", "m");
+  await edit(
+    ctx,
+    configs.length
+      ? `🗂 Ваши конфиги\n\n🟢 срок действует · 🔴 срок истёк\n🔌 подключён · ⚪ не подключён · ❔ нет данных\n\nСтраница ${page + 1} из ${totalPages} · всего: ${configs.length}`
+      : "📭 У Вас пока нет доступных конфигов.",
+    keyboard
+  );
+}
+
 async function showUserConfig(
   ctx: Context,
   config: VpnConfigRecord,
@@ -662,7 +703,7 @@ async function showUserConfig(
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");
   await edit(
     ctx,
-    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}\n📊 Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
+    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n${connectionStatusLine(traffic)}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}\n📊 Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
     keyboard
   );
 }
@@ -725,20 +766,30 @@ async function showTrafficStats(
 async function showAdminUser(
   ctx: Context,
   user: UserRecord,
-  db: AppDatabase
+  db: AppDatabase,
+  trafficService: TrafficService,
+  requestedPage: number
 ): Promise<void> {
   const configs = await db.listConfigsForUserAdmin(user.id);
+  const { page, totalPages, items } = paginateConfigs(configs, requestedPage);
+  const connectionStates = await trafficService.connectionStates(items);
   const keyboard = new InlineKeyboard();
-  for (const config of configs.slice(0, 30))
+  for (const config of items)
     keyboard
-      .text(`${statusIcon(config)} ${config.displayName}`, `ac|${config.id}`)
+      .text(
+        configListLabel(config, connectionStates.get(config.id)),
+        `ac|${config.id}`
+      )
       .row();
+  addPaginationRow(keyboard, page, totalPages, (targetPage) =>
+    `aup|${user.id}|${targetPage}`
+  );
   keyboard.text("➕ Выдать новый конфиг", `ai|${user.id}`).row();
   keyboard.text("🔗 Привязать старый конфиг", `ab|${user.id}`).row();
   keyboard.text("🔎 Новый поиск", "as").text("🛠 Админ-панель", "a");
   await edit(
     ctx,
-    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}`,
+    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}\n\n🟢 срок действует · 🔴 срок истёк\n🔌 подключён · ⚪ не подключён · ❔ нет данных\n\nСтраница ${page + 1} из ${totalPages}`,
     keyboard
   );
 }
@@ -757,6 +808,7 @@ async function showAdminConfig(
     `Конфиг: ${config.displayName}`,
     `Пользователь: ${userLabel(user)}`,
     `Статус: ${expired ? "Просрочен" : "Активен"}`,
+    connectionStatusLine(traffic),
     `Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
     `Сервер: ${config.serverKey === "old" ? "старый" : "новый"}`,
     `OpenVPN-клиент: ${config.clientName}`,
@@ -973,6 +1025,60 @@ function statusIcon(config: VpnConfigRecord): string {
   return isExpired(config.expiresAt) || config.status === "expired"
     ? "🔴"
     : "🟢";
+}
+
+function connectionIcon(state: ConfigConnectionState | undefined): string {
+  if (!state?.liveAvailable) return "❔";
+  return state.activeConnections > 0 ? "🔌" : "⚪";
+}
+
+function configListLabel(
+  config: VpnConfigRecord,
+  state: ConfigConnectionState | undefined
+): string {
+  return `${statusIcon(config)}${connectionIcon(state)} ${config.displayName}`;
+}
+
+function connectionStatusLine(state: ConfigConnectionState): string {
+  if (!state.liveAvailable)
+    return "❔ Подключён сейчас: данные сервера недоступны";
+  if (state.activeConnections === 0) return "⚪ Подключён сейчас: нет";
+  return state.activeConnections === 1
+    ? "🔌 Подключён сейчас: да"
+    : `🔌 Подключён сейчас: да (активных подключений: ${state.activeConnections})`;
+}
+
+function paginateConfigs(
+  configs: VpnConfigRecord[],
+  requestedPage: number
+): {
+  page: number;
+  totalPages: number;
+  items: VpnConfigRecord[];
+} {
+  const totalPages = Math.max(1, Math.ceil(configs.length / CONFIG_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  return {
+    page,
+    totalPages,
+    items: configs.slice(
+      page * CONFIG_PAGE_SIZE,
+      (page + 1) * CONFIG_PAGE_SIZE
+    ),
+  };
+}
+
+function addPaginationRow(
+  keyboard: InlineKeyboard,
+  page: number,
+  totalPages: number,
+  callback: (page: number) => string
+): void {
+  if (totalPages <= 1) return;
+  if (page > 0) keyboard.text("⬅️", callback(page - 1));
+  keyboard.text(`${page + 1}/${totalPages}`, callback(page));
+  if (page < totalPages - 1) keyboard.text("➡️", callback(page + 1));
+  keyboard.row();
 }
 
 function userLabel(user: UserRecord): string {

@@ -55,15 +55,33 @@ refresh_crl() {
   chmod 0644 "$OPENVPN_DIR/crl.pem"
 }
 
+print_active_sessions() {
+  if [[ -r "$STATUS_FILE" ]]; then
+    awk -F '\t' '
+      $1 == "HEADER" && $2 == "CLIENT_LIST" {
+        for (i = 3; i <= NF; i++) column[$i] = i - 1
+        next
+      }
+      $1 == "CLIENT_LIST" && column["Common Name"] {
+        printf "active\t%s\t%s\t%s\t%s\n",
+          $(column["Common Name"]),
+          $(column["Connected Since (time_t)"]),
+          $(column["Bytes Received"]),
+          $(column["Bytes Sent"])
+      }
+    ' "$STATUS_FILE"
+  fi
+}
+
 command="${1:-}"
 case "$command" in
-  list|stats|traffic-sessions)
+  list|stats|traffic-sessions|active-sessions)
     ;;
   create|download|revoke)
     validate_client "${2:-}"
     ;;
   *)
-    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions"
+    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions, active-sessions"
     ;;
 esac
 
@@ -115,20 +133,9 @@ case "$command" in
         | sort -z \
         | xargs -0 -r cat
     fi
-    if [[ -r "$STATUS_FILE" ]]; then
-      awk -F '\t' '
-        $1 == "HEADER" && $2 == "CLIENT_LIST" {
-          for (i = 3; i <= NF; i++) column[$i] = i - 1
-          next
-        }
-        $1 == "CLIENT_LIST" && column["Common Name"] {
-          printf "active\t%s\t%s\t%s\t%s\n",
-            $(column["Common Name"]),
-            $(column["Connected Since (time_t)"]),
-            $(column["Bytes Received"]),
-            $(column["Bytes Sent"])
-        }
-      ' "$STATUS_FILE"
-    fi
+    print_active_sessions
+    ;;
+  active-sessions)
+    print_active_sessions
     ;;
 esac
