@@ -673,7 +673,7 @@ async function showUserConfigs(
   await edit(
     ctx,
     configs.length
-      ? `🗂 Ваши конфиги\n\n🟢 срок действует · 🔴 срок истёк\n🔌 подключён · ⚪ не подключён · ❔ нет данных\n\nСтраница ${page + 1} из ${totalPages} · всего: ${configs.length}`
+      ? `🗂 Ваши конфиги\n\n🟢 срок действует\n🔴 срок истёк\n🔌 подключён\n⚪ не подключён\n❔ нет данных\n\nСтраница ${page + 1} из ${totalPages} · всего: ${configs.length}`
       : "📭 У Вас пока нет доступных конфигов.",
     keyboard
   );
@@ -789,7 +789,7 @@ async function showAdminUser(
   keyboard.text("🔎 Новый поиск", "as").text("🛠 Админ-панель", "a");
   await edit(
     ctx,
-    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}\n\n🟢 срок действует · 🔴 срок истёк\n🔌 подключён · ⚪ не подключён · ❔ нет данных\n\nСтраница ${page + 1} из ${totalPages}`,
+    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}\n\n🟢 срок действует\n🔴 срок истёк\n🔌 подключён\n⚪ не подключён\n❔ нет данных\n\nСтраница ${page + 1} из ${totalPages}`,
     keyboard
   );
 }
