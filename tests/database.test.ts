@@ -23,6 +23,14 @@ describe("AppDatabase с Prisma", () => {
     expect(await db.searchUsers("@NEW")).toHaveLength(1);
   });
 
+  it("возвращает получателей рассылки без администратора", async () => {
+    await db.upsertUser({ telegramId: "100", firstName: "Администратор" });
+    await db.upsertUser({ telegramId: "200", firstName: "Иван" });
+    await db.upsertUser({ telegramId: "300", firstName: "Ольга" });
+
+    expect(await db.listBroadcastRecipients("100")).toEqual(["200", "300"]);
+  });
+
   it("скрывает конфиг после окончания десятидневного окна", async () => {
     const user = await db.upsertUser({ telegramId: "100", firstName: "Иван" });
     const now = new Date().toISOString();

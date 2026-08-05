@@ -118,6 +118,15 @@ export class AppDatabase {
     return rows.map(mapUser);
   }
 
+  async listBroadcastRecipients(excludedTelegramId: string): Promise<string[]> {
+    const rows = await this.prisma.user.findMany({
+      where: { telegramId: { not: excludedTelegramId } },
+      orderBy: { id: "asc" },
+      select: { telegramId: true },
+    });
+    return rows.map(({ telegramId }) => telegramId);
+  }
+
   async insertConfig(config: VpnConfigRecord): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.vpnConfig.create({ data: configData(config) });

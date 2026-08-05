@@ -1,6 +1,8 @@
 import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
+import type { MessageEntity } from "grammy/types";
 import { DateTime } from "luxon";
 import type { AppConfig } from "./config.js";
+import { broadcastText } from "./broadcast-service.js";
 import { ConfigService } from "./config-service.js";
 import { AppDatabase } from "./database.js";
 import type {
@@ -32,7 +34,8 @@ type DateTarget =
 type PendingInput =
   | { kind: "search" }
   | { kind: "rename"; configId: string }
-  | { kind: "date"; target: DateTarget };
+  | { kind: "date"; target: DateTarget }
+  | { kind: "broadcast" };
 
 const pendingInputs = new Map<string, PendingInput>();
 const operationLocks = new Set<string>();
@@ -50,6 +53,11 @@ export function createBot(
   trafficService: TrafficService
 ): BotApplication {
   const bot = new Bot(appConfig.botToken);
+  const broadcastDrafts = new Map<
+    string,
+    { text: string; entities?: MessageEntity[] }
+  >();
+  let broadcastRunning = false;
 
   bot.catch((error) => {
     console.error("Необработанная ошибка Telegram-бота", error.error);
@@ -112,6 +120,37 @@ export function createBot(
           reply_markup: usersKeyboard(users),
         });
       }
+      return;
+    }
+
+    if (pending.kind === "broadcast") {
+      if (!isAdmin(ctx, appConfig)) return;
+      const message = ctx.message.text;
+      if (!message.trim()) {
+        pendingInputs.set(telegramId, pending);
+        await ctx.reply("Сообщение для рассылки не должно быть пустым.", {
+          reply_markup: new InlineKeyboard().text("❌ Отмена", "bca"),
+        });
+        return;
+      }
+      broadcastDrafts.set(telegramId, {
+        text: message,
+        ...(ctx.message.entities ? { entities: ctx.message.entities } : {}),
+      });
+      const recipients = await db.listBroadcastRecipients(telegramId);
+      await ctx.reply(
+        `📣 Предпросмотр рассылки\n\nПолучателей: ${recipients.length}\nСледующее сообщение будет отправлено без изменений:`,
+        {
+          reply_markup: new InlineKeyboard().text("❌ Отменить", "bca"),
+        }
+      );
+      await ctx.reply(message, {
+        ...(ctx.message.entities ? { entities: ctx.message.entities } : {}),
+        reply_markup: new InlineKeyboard()
+          .text("✅ Подтвердить рассылку", "bcc")
+          .row()
+          .text("❌ Отменить", "bca"),
+      });
       return;
     }
 
@@ -432,6 +471,87 @@ export function createBot(
       "🔎 Отправьте username пользователя или его числовой Telegram ID.",
       new InlineKeyboard().text("❌ Отмена", "a")
     );
+  });
+
+  bot.callbackQuery("bc", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (broadcastRunning)
+      return showAlert(ctx, "Предыдущая рассылка ещё выполняется.");
+    const telegramId = String(ctx.from.id);
+    broadcastDrafts.delete(telegramId);
+    pendingInputs.set(telegramId, { kind: "broadcast" });
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "📣 Отправьте текст сообщения для рассылки. После этого бот покажет предпросмотр и попросит подтверждение.",
+      new InlineKeyboard().text("❌ Отмена", "bca")
+    );
+  });
+
+  bot.callbackQuery("bca", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const telegramId = String(ctx.from.id);
+    pendingInputs.delete(telegramId);
+    broadcastDrafts.delete(telegramId);
+    await ctx.answerCallbackQuery({ text: "Рассылка отменена." });
+    await showAdminMain(ctx, db);
+  });
+
+  bot.callbackQuery("bcc", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (broadcastRunning)
+      return showAlert(ctx, "Предыдущая рассылка ещё выполняется.");
+    const telegramId = String(ctx.from.id);
+    const draft = broadcastDrafts.get(telegramId);
+    if (!draft) return showAlert(ctx, "Черновик рассылки не найден.");
+
+    broadcastRunning = true;
+    broadcastDrafts.delete(telegramId);
+    pendingInputs.delete(telegramId);
+    await ctx.answerCallbackQuery({ text: "Рассылка запущена." });
+    await edit(
+      ctx,
+      "⏳ Рассылка выполняется. Ошибки отдельных пользователей не остановят отправку. По завершении Вы получите отчёт.",
+      new InlineKeyboard().text("🛠 Админ-панель", "a")
+    );
+
+    void (async () => {
+      try {
+        const recipients = await db.listBroadcastRecipients(telegramId);
+        const report = await broadcastText(
+          recipients,
+          draft.text,
+          async (recipientId, text) => {
+            await bot.api.sendMessage(recipientId, text, {
+              ...(draft.entities ? { entities: draft.entities } : {}),
+            });
+          }
+        );
+        await bot.api.sendMessage(
+          telegramId,
+          [
+            "✅ Рассылка завершена",
+            "",
+            `👥 Получателей: ${report.total}`,
+            `✅ Доставлено: ${report.delivered}`,
+            `🚫 Бот заблокирован или чат недоступен: ${report.unavailable}`,
+            `⚠️ Другие ошибки: ${report.failed}`,
+          ].join("\n"),
+          { reply_markup: new InlineKeyboard().text("🛠 Админ-панель", "a") }
+        );
+      } catch (error) {
+        logError(error);
+        await bot.api
+          .sendMessage(
+            telegramId,
+            "❌ Не удалось выполнить рассылку из-за общей ошибки. Попробуйте ещё раз.",
+            { reply_markup: new InlineKeyboard().text("🛠 Админ-панель", "a") }
+          )
+          .catch(logError);
+      } finally {
+        broadcastRunning = false;
+      }
+    })();
   });
 
   bot.callbackQuery(/^au\|(\d+)$/, async (ctx) => {
@@ -834,6 +954,8 @@ async function showAdminMain(
     text,
     new InlineKeyboard()
       .text("🔎 Найти пользователя", "as")
+      .row()
+      .text("📣 Рассылка", "bc")
       .row()
       .text("📊 Статистика", "at")
       .row()
