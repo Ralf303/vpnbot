@@ -119,6 +119,20 @@ describe("ConfigService", () => {
     expect(vpn.calls.at(-1)).toBe("download:old:legacy_download");
   });
 
+  it("позволяет администратору скачать существующий просроченный конфиг без перевыпуска", async () => {
+    const user = await db.upsertUser({ telegramId: "108", firstName: "Игорь" });
+    const config = await service.issue(user, "2020-01-01T20:59:59.999Z");
+    const createCallsBeforeDownload = vpn.calls.filter((call) =>
+      call.startsWith("create:")
+    ).length;
+
+    await expect(service.downloadExisting(config)).resolves.toBeInstanceOf(Buffer);
+    expect(vpn.calls.at(-1)).toBe(`download:new:${config.clientName}`);
+    expect(vpn.calls.filter((call) => call.startsWith("create:"))).toHaveLength(
+      createCallsBeforeDownload
+    );
+  });
+
   it("пересоздаёт конфиг на менее загруженном сервере и сохраняет данные", async () => {
     const user = await db.upsertUser({ telegramId: "105", firstName: "Сергей" });
     const original = await service.issue(user, "2027-03-01T20:59:59.999Z");
@@ -154,5 +168,20 @@ describe("ConfigService", () => {
     expect(restored.serverKey).toBe("old");
     expect(restored.isLegacy).toBe(true);
     expect(vpn.calls.filter((call) => call.startsWith("revoke:new:"))).toHaveLength(1);
+  });
+
+  it("принудительно переносит конфиг на выбранный сервер", async () => {
+    const user = await db.upsertUser({ telegramId: "107", firstName: "Максим" });
+    const original = await service.issue(user, "2027-05-01T20:59:59.999Z");
+
+    const moved = await service.moveToServer(original, "old");
+
+    expect(moved.config.serverKey).toBe("old");
+    expect(moved.config.clientName).not.toBe(original.clientName);
+    expect(vpn.calls).toContain(`create:old:${moved.config.clientName}`);
+    expect(vpn.calls).toContain(`revoke:new:${original.clientName}`);
+    await expect(service.moveToServer(moved.config, "old")).rejects.toThrow(
+      "уже находится"
+    );
   });
 });

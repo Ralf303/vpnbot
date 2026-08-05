@@ -100,6 +100,13 @@ export class ConfigService {
     return this.vpn.downloadClient(config.serverKey, config.clientName);
   }
 
+  async downloadExisting(config: VpnConfigRecord): Promise<Buffer> {
+    if (config.status === "revoked") {
+      throw new Error("Конфиг отозван");
+    }
+    return this.vpn.downloadClient(config.serverKey, config.clientName);
+  }
+
   async migrateLegacy(config: VpnConfigRecord): Promise<{
     file: Buffer;
     clientName: string;
@@ -191,6 +198,35 @@ export class ConfigService {
     }
 
     const serverKey = await this.selectIssueServer();
+    return this.recreateOnServer(config, serverKey);
+  }
+
+  async moveToServer(
+    config: VpnConfigRecord,
+    serverKey: ServerKey
+  ): Promise<{
+    config: VpnConfigRecord;
+    file: Buffer;
+  }> {
+    if (config.status !== "active" || isExpired(config.expiresAt)) {
+      throw new Error("Срок действия конфига истёк");
+    }
+    if (config.serverKey === serverKey) {
+      throw new Error("Конфиг уже находится на выбранном сервере");
+    }
+    if (!this.vpn.isConfigured(serverKey)) {
+      throw new Error("Выбранный VPN-сервер не настроен");
+    }
+    return this.recreateOnServer(config, serverKey);
+  }
+
+  private async recreateOnServer(
+    config: VpnConfigRecord,
+    serverKey: ServerKey
+  ): Promise<{
+    config: VpnConfigRecord;
+    file: Buffer;
+  }> {
     const { clientName: newClientName, file } =
       await this.createUniqueClient(serverKey);
     try {

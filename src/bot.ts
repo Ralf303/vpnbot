@@ -465,6 +465,112 @@ export function createBot(
     await showAdminConfig(ctx, config, db, appConfig, trafficService);
   });
 
+  bot.callbackQuery(/^adl\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery({ text: "Подготавливаю файл…" });
+    try {
+      const file = await configService.downloadExisting(config);
+      await ctx.replyWithDocument(
+        new InputFile(file, vpnFileName(config.clientName)),
+        {
+          caption: `🔐 Текущий файл конфига «${config.displayName}». Файл не перевыпускался.`,
+          reply_markup: new InlineKeyboard().text(
+            "🔎 Вернуться к конфигу",
+            `ac|${config.id}`
+          ),
+        }
+      );
+    } catch (error) {
+      logError(error);
+      await ctx.reply(
+        "Не удалось получить текущий файл. Возможно, клиент уже отозван на VPN-сервере.",
+        {
+          reply_markup: new InlineKeyboard().text("Назад", `ac|${config.id}`),
+        }
+      );
+    }
+  });
+
+  bot.callbackQuery(/^am\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг не найден.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Сначала продлите срок действия конфига.");
+    const targetServer = config.serverKey === "new" ? "old" : "new";
+    const targetName = targetServer === "old" ? "старый" : "новый";
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `🔄 Перенести «${config.displayName}» на ${targetName} сервер?\n\nБудет создан новый OpenVPN-клиент. Текущий файл сразу перестанет подключаться, а пользователю будет отправлен новый файл. Название и срок действия сохранятся.`,
+      new InlineKeyboard()
+        .text("✅ Подтвердить перенос", `amc|${config.id}|${targetServer}`)
+        .row()
+        .text("❌ Отмена", `ac|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^amc\|([^|]+)\|(new|old)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const config = await db.getConfig(ctx.match[1]!);
+    const targetServer = ctx.match[2] as "new" | "old";
+    if (!config || config.status === "revoked")
+      return showAlert(ctx, "Конфиг не найден.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Сначала продлите срок действия конфига.");
+    if (config.serverKey === targetServer)
+      return showAlert(ctx, "Конфиг уже находится на выбранном сервере.");
+    if (operationLocks.has(config.id))
+      return showAlert(ctx, "Операция уже выполняется.");
+
+    operationLocks.add(config.id);
+    await ctx.answerCallbackQuery({ text: "Переношу конфиг…" });
+    try {
+      const moved = await configService.moveToServer(config, targetServer);
+      const targetName = targetServer === "old" ? "старый" : "новый";
+      const user = await db.getUserById(config.userId);
+
+      if (user) {
+        await bot.api
+          .sendDocument(
+            user.telegramId,
+            new InputFile(moved.file, vpnFileName(moved.config.clientName)),
+            {
+              caption: `🔄 Конфиг «${moved.config.displayName}» перенесён администратором на другой сервер. Старый файл больше не подключится. Используйте этот новый файл. Срок действия: до ${formatDate(moved.config.expiresAt, appConfig.timezone)}.`,
+              reply_markup: new InlineKeyboard().text(
+                "🔎 Открыть конфиг",
+                `uc|${moved.config.id}`
+              ),
+            }
+          )
+          .catch(logError);
+      }
+
+      await edit(
+        ctx,
+        `✅ Конфиг «${moved.config.displayName}» перенесён на ${targetName} сервер. Старый файл отозван.`,
+        new InlineKeyboard()
+          .text("📥 Получить новый файл", `adl|${moved.config.id}`)
+          .row()
+          .text("🔎 Открыть конфиг", `ac|${moved.config.id}`)
+      );
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Не удалось перенести конфиг. Исходный конфиг сохранён.", {
+        reply_markup: new InlineKeyboard()
+          .text("Повторить", `am|${config.id}`)
+          .row()
+          .text("Назад", `ac|${config.id}`),
+      });
+    } finally {
+      operationLocks.delete(config.id);
+    }
+  });
+
   bot.callbackQuery(/^ai\|(\d+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const user = await db.getUserById(Number(ctx.match[1]));
@@ -819,6 +925,9 @@ async function showAdminConfig(
     text,
     new InlineKeyboard()
       .text(expired ? "💳 Продлить" : "📅 Изменить срок", `ae|${config.id}`)
+      .row()
+      .text("📥 Получить файл", `adl|${config.id}`)
+      .text("🔄 Поменять сервер", `am|${config.id}`)
       .row()
       .text("⛔ Отозвать", `ar|${config.id}`)
       .row()
