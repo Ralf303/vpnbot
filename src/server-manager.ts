@@ -345,6 +345,9 @@ if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
     curl -fsSL https://raw.githubusercontent.com/hwdsl2/openvpn-install/5aeec9eac6e663a5908f56c971d9278dd861c66e/openvpn-install.sh -o openvpn-install.sh
     chmod +x openvpn-install.sh
     bash openvpn-install.sh --auto --proto TCP --port 1194 --clientname vpnbot-bootstrap --dns1 1.1.1.1 --dns2 1.0.0.1
+    # Серверная схема маршрутизирует только IPv4; не выдаём клиентам IPv6-маршрут.
+    sed -i '/^server-ipv6/d' /etc/openvpn/server/server.conf
+    sed -i 's/^push "redirect-gateway def1 ipv6 /push "redirect-gateway def1 /' /etc/openvpn/server/server.conf
   fi
   curl -fsSL https://raw.githubusercontent.com/Ralf303/vpnbot/main/deploy/openvpn-bot-helper -o /usr/local/sbin/openvpn-bot-helper
   chmod 0755 /usr/local/sbin/openvpn-bot-helper
