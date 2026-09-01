@@ -58,13 +58,15 @@ print_active_sessions() {
   local status_files=()
   local status_file
 
-  # hwdsl2/openvpn-install has used both server-status.tsv (status-version 3)
-  # and status-<instance>.log (status-version 2). Read every existing status
-  # file so live statistics also work with renamed instances such as
-  # server-tcp without changing or restarting OpenVPN.
+  # hwdsl2/openvpn-install uses several names depending on its version:
+  # server-status.tsv, server-status-<instance>.tsv and
+  # status-<instance>.log. Read every existing status file so live statistics
+  # work with renamed instances such as server-tcp without changing or
+  # restarting OpenVPN.
   shopt -s nullglob
   status_files=(
     /run/openvpn-server/server-status.tsv
+    /run/openvpn-server/server-status-*.tsv
     /run/openvpn-server/status-*.log
     /run/openvpn/status*.log
     /var/log/openvpn/status*.log

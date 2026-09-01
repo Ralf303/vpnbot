@@ -248,4 +248,4 @@ sudo cp -a /root/openvpn-install.sh /root/openvpn-install.before-vpnbot.sh
 
 ## Трафик
 
-Раздел «Статистика» показывает накопительный трафик отдельно для каждого VPS и общий итог. Карточка конфига показывает его собственный трафик. Завершённые сессии хранятся в PostgreSQL, активные добавляются из OpenVPN status-файла и не удваиваются при последующем импорте завершённой сессии. Helper поддерживает как TSV `status-version 3`, так и CSV `status-version 2` с именами вида `/run/openvpn-server/status-<instance>.log`.
+Раздел «Статистика» показывает накопительный трафик отдельно для каждого VPS и общий итог. Карточка конфига показывает его собственный трафик. Завершённые сессии хранятся в PostgreSQL, активные добавляются из OpenVPN status-файла и не удваиваются при последующем импорте завершённой сессии. Helper поддерживает TSV `status-version 3` (`server-status.tsv` и `server-status-<instance>.tsv`) и CSV `status-version 2` (`status-<instance>.log`).
