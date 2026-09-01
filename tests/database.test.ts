@@ -31,6 +31,36 @@ describe("AppDatabase с Prisma", () => {
     expect(await db.listBroadcastRecipients("100")).toEqual(["200", "300"]);
   });
 
+  it("counts Telegram users and only linked VK accounts", async () => {
+    const telegram = await db.upsertUser({
+      telegramId: "100",
+      firstName: "Ivan",
+    });
+    await db.upsertUser({ telegramId: "200", firstName: "Olga" });
+    await db.upsertVkUser({
+      vkId: "700",
+      peerId: "700",
+      firstName: "Unlinked",
+    });
+    await db.createAccountLinkToken({
+      userId: telegram.id,
+      provider: "vk",
+      tokenHash: "b".repeat(64),
+      expiresAt: new Date("2027-01-01T00:00:00.000Z"),
+    });
+    await db.consumeVkAccountLink({
+      tokenHash: "b".repeat(64),
+      vkId: "701",
+      peerId: "701",
+      firstName: "Ivan",
+      now: new Date("2026-08-31T00:00:00.000Z"),
+    });
+
+    const stats = await db.stats();
+    expect(stats.telegramUsers).toBe(2);
+    expect(stats.linkedVkUsers).toBe(1);
+  });
+
   it("создаёт отдельного VK-пользователя без фиктивного Telegram ID", async () => {
     const user = await db.upsertVkUser({
       vkId: "700",

@@ -8,7 +8,6 @@ PKI_DIR="$EASYRSA_DIR/pki"
 CLIENT_COMMON="$OPENVPN_DIR/client-common.txt"
 LOCK_FILE="/run/lock/openvpn-bot-helper.lock"
 VPN_SUBNET="10.8.0.0/24"
-STATUS_FILE="/run/openvpn-server/server-status.tsv"
 TRAFFIC_EVENTS_DIR="/var/lib/openvpn-bot/traffic-events"
 
 die() {
@@ -56,21 +55,44 @@ refresh_crl() {
 }
 
 print_active_sessions() {
-  if [[ -r "$STATUS_FILE" ]]; then
-    awk -F '\t' '
-      $1 == "HEADER" && $2 == "CLIENT_LIST" {
-        for (i = 3; i <= NF; i++) column[$i] = i - 1
+  local status_files=()
+  local status_file
+
+  # hwdsl2/openvpn-install has used both server-status.tsv (status-version 3)
+  # and status-<instance>.log (status-version 2). Read every existing status
+  # file so live statistics also work with renamed instances such as
+  # server-tcp without changing or restarting OpenVPN.
+  shopt -s nullglob
+  status_files=(
+    /run/openvpn-server/server-status.tsv
+    /run/openvpn-server/status-*.log
+    /run/openvpn/status*.log
+    /var/log/openvpn/status*.log
+  )
+  shopt -u nullglob
+
+  for status_file in "${status_files[@]}"; do
+    [[ -r "$status_file" ]] || continue
+    awk '
+      {
+        separator = index($0, "\t") ? "\t" : ","
+        count = split($0, field, separator)
+      }
+      field[1] == "HEADER" && field[2] == "CLIENT_LIST" {
+        for (i = 3; i <= count; i++) column[field[i]] = i - 1
         next
       }
-      $1 == "CLIENT_LIST" && column["Common Name"] {
+      field[1] == "CLIENT_LIST" && column["Common Name"] &&
+        column["Connected Since (time_t)"] && column["Bytes Received"] &&
+        column["Bytes Sent"] {
         printf "active\t%s\t%s\t%s\t%s\n",
-          $(column["Common Name"]),
-          $(column["Connected Since (time_t)"]),
-          $(column["Bytes Received"]),
-          $(column["Bytes Sent"])
+          field[column["Common Name"]],
+          field[column["Connected Since (time_t)"]],
+          field[column["Bytes Received"]],
+          field[column["Bytes Sent"]]
       }
-    ' "$STATUS_FILE"
-  fi
+    ' "$status_file"
+  done
 }
 
 command="${1:-}"

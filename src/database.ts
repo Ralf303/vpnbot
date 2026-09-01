@@ -749,27 +749,41 @@ export class AppDatabase {
   }
 
   async stats(): Promise<{
-    users: number;
+    telegramUsers: number;
+    linkedVkUsers: number;
     active: number;
     expired: number;
     perServer: Record<ServerKey, number>;
   }> {
     const now = new Date();
-    const [users, active, expired, grouped] = await Promise.all([
-      this.prisma.user.count(),
-      this.prisma.vpnConfig.count({ where: { status: "active", expiresAt: { gt: now } } }),
-      this.prisma.vpnConfig.count({
-        where: { status: { not: "revoked" }, expiresAt: { lte: now }, hiddenAt: { gt: now } },
-      }),
-      this.prisma.vpnConfig.groupBy({
-        by: ["serverKey"],
-        where: { status: { not: "revoked" } },
-        _count: { _all: true },
-      }),
-    ]);
+    const [telegramUsers, linkedVkUsers, active, expired, grouped] =
+      await Promise.all([
+        this.prisma.user.count({ where: { telegramId: { not: null } } }),
+        this.prisma.messengerIdentity.count({
+          where: {
+            provider: "vk",
+            user: { telegramId: { not: null } },
+          },
+        }),
+        this.prisma.vpnConfig.count({
+          where: { status: "active", expiresAt: { gt: now } },
+        }),
+        this.prisma.vpnConfig.count({
+          where: {
+            status: { not: "revoked" },
+            expiresAt: { lte: now },
+            hiddenAt: { gt: now },
+          },
+        }),
+        this.prisma.vpnConfig.groupBy({
+          by: ["serverKey"],
+          where: { status: { not: "revoked" } },
+          _count: { _all: true },
+        }),
+      ]);
     const perServer: Record<ServerKey, number> = {};
     for (const row of grouped) perServer[row.serverKey] = row._count._all;
-    return { users, active, expired, perServer };
+    return { telegramUsers, linkedVkUsers, active, expired, perServer };
   }
 
   async listServers(): Promise<VpnServerRecord[]> {

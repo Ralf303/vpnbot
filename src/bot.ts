@@ -1393,7 +1393,8 @@ async function showAdminMain(
   const text = [
     "🛠 Админ-панель",
     "",
-    `👥 Пользователей: ${stats.users}`,
+    `👥 Пользователей Telegram: ${stats.telegramUsers}`,
+    `🔵 Подключили VK: ${stats.linkedVkUsers}`,
     `🟢 Активных конфигов: ${stats.active}`,
     `🔴 Просроченных в меню: ${stats.expired}`,
   ].join("\n");
