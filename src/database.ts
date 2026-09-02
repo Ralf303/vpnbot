@@ -6,10 +6,12 @@ import type {
   LegacyClient,
   MessengerProvider,
   VpnServer,
+  ConfigRequest,
 } from "./generated/prisma/client.js";
 import { PrismaClient } from "./generated/prisma/client.js";
 import type {
   CompletedTrafficSession,
+  ConfigRequestRecord,
   LegacyClientRecord,
   PendingRevocationRecord,
   ServerKey,
@@ -75,6 +77,18 @@ function mapServer(row: VpnServer): VpnServerRecord {
     lastError: row.lastError,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+function mapConfigRequest(row: ConfigRequest): ConfigRequestRecord {
+  return {
+    id: row.id,
+    userId: row.userId,
+    status: row.status,
+    note: row.note,
+    configId: row.configId,
+    requestedAt: row.requestedAt.toISOString(),
+    resolvedAt: row.resolvedAt?.toISOString() ?? null,
   };
 }
 
@@ -344,6 +358,91 @@ export class AppDatabase {
     return row ? mapUser(row) : null;
   }
 
+  async createConfigRequest(userId: number, note: string | null): Promise<{
+    request: ConfigRequestRecord;
+    created: boolean;
+  }> {
+    try {
+      const row = await this.prisma.configRequest.create({
+        data: { userId, note },
+      });
+      return { request: mapConfigRequest(row), created: true };
+    } catch (error) {
+      const existing = await this.prisma.configRequest.findFirst({
+        where: { userId, status: { in: ["pending", "processing"] } },
+        orderBy: { requestedAt: "desc" },
+      });
+      if (existing)
+        return { request: mapConfigRequest(existing), created: false };
+      throw error;
+    }
+  }
+
+  async getOpenConfigRequestForUser(
+    userId: number
+  ): Promise<ConfigRequestRecord | null> {
+    const row = await this.prisma.configRequest.findFirst({
+      where: { userId, status: { in: ["pending", "processing"] } },
+      orderBy: { requestedAt: "desc" },
+    });
+    return row ? mapConfigRequest(row) : null;
+  }
+
+  async getConfigRequest(id: number): Promise<ConfigRequestRecord | null> {
+    const row = await this.prisma.configRequest.findUnique({ where: { id } });
+    return row ? mapConfigRequest(row) : null;
+  }
+
+  async countPendingConfigRequests(): Promise<number> {
+    return this.prisma.configRequest.count({ where: { status: "pending" } });
+  }
+
+  async listPendingConfigRequests(
+    limit = 20
+  ): Promise<Array<{ request: ConfigRequestRecord; user: UserRecord }>> {
+    const rows = await this.prisma.configRequest.findMany({
+      where: { status: "pending" },
+      include: { user: true },
+      orderBy: { requestedAt: "asc" },
+      take: limit,
+    });
+    return rows.map((row) => ({
+      request: mapConfigRequest(row),
+      user: mapUser(row.user),
+    }));
+  }
+
+  async claimConfigRequest(id: number): Promise<boolean> {
+    const result = await this.prisma.configRequest.updateMany({
+      where: { id, status: "pending" },
+      data: { status: "processing" },
+    });
+    return result.count === 1;
+  }
+
+  async releaseConfigRequest(id: number): Promise<void> {
+    await this.prisma.configRequest.updateMany({
+      where: { id, status: "processing" },
+      data: { status: "pending" },
+    });
+  }
+
+  async releaseProcessingConfigRequests(): Promise<number> {
+    const result = await this.prisma.configRequest.updateMany({
+      where: { status: "processing" },
+      data: { status: "pending" },
+    });
+    return result.count;
+  }
+
+  async rejectConfigRequest(id: number): Promise<boolean> {
+    const result = await this.prisma.configRequest.updateMany({
+      where: { id, status: "pending" },
+      data: { status: "rejected", resolvedAt: new Date() },
+    });
+    return result.count === 1;
+  }
+
   async insertConfig(config: VpnConfigRecord): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.vpnConfig.create({ data: configData(config) });
@@ -351,6 +450,38 @@ export class AppDatabase {
         where: { name: config.clientName },
         create: { name: config.clientName, configId: config.id },
         update: { configId: config.id },
+      });
+    });
+  }
+
+  async insertConfigForRequest(
+    config: VpnConfigRecord,
+    requestId: number
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      const request = await tx.configRequest.findFirst({
+        where: {
+          id: requestId,
+          userId: config.userId,
+          status: "processing",
+        },
+        select: { id: true },
+      });
+      if (!request) throw new Error("Заявка уже обработана или отменена");
+
+      await tx.vpnConfig.create({ data: configData(config) });
+      await tx.clientName.upsert({
+        where: { name: config.clientName },
+        create: { name: config.clientName, configId: config.id },
+        update: { configId: config.id },
+      });
+      await tx.configRequest.update({
+        where: { id: requestId },
+        data: {
+          status: "approved",
+          configId: config.id,
+          resolvedAt: new Date(),
+        },
       });
     });
   }

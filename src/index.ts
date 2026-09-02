@@ -31,6 +31,13 @@ const vkBot = config.vk
     )
   : null;
 
+const recoveredRequests = await db.releaseProcessingConfigRequests();
+if (recoveredRequests > 0) {
+  console.warn(
+    `Возвращено в очередь незавершённых заявок: ${recoveredRequests}`
+  );
+}
+
 for (const envServer of Object.values(config.envServers)) {
   await db
     .upsertBuiltinServer({
