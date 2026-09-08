@@ -4,7 +4,10 @@ import { DateTime } from "luxon";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { createVkAccountLinkCode } from "./account-link.js";
 import type { AppConfig } from "./config.js";
-import { broadcastText } from "./broadcast-service.js";
+import { broadcastText, broadcastChannels, formatBroadcastReport, vkBroadcastText, sendWithRateLimitRetry, type BroadcastAudience } from "./broadcast-service.js";
+import { massExtensionPeriod, parseExtensionDays } from "./mass-extension.js";
+import type { VkApiClient } from "./vk-api.js";
+import { keyboard as vkKeyboard } from "./vk-bot.js";
 import { ConfigService } from "./config-service.js";
 import { AppDatabase } from "./database.js";
 import type {
@@ -39,21 +42,14 @@ type PendingInput =
   | { kind: "search" }
   | { kind: "rename"; configId: string }
   | { kind: "date"; target: DateTarget }
-  | { kind: "broadcast" }
+  | { kind: "broadcast"; audience: BroadcastAudience }
+  | { kind: "mass-extension" }
   | { kind: "server-add" }
   | { kind: "server-rename"; serverKey: ServerKey };
 
 const pendingInputs = new Map<string, PendingInput>();
 const operationLocks = new Set<string>();
 const CONFIG_PAGE_SIZE = 10;
-const MASS_EXTENSION_PERIODS = {
-  "7d": { label: "7 дней", duration: { days: 7 } },
-  "1m": { label: "1 месяц", duration: { months: 1 } },
-  "3m": { label: "3 месяца", duration: { months: 3 } },
-  "6m": { label: "6 месяцев", duration: { months: 6 } },
-  "1y": { label: "1 год", duration: { years: 1 } },
-} as const;
-type MassExtensionCode = keyof typeof MASS_EXTENSION_PERIODS;
 
 export interface BotApplication {
   bot: Bot;
@@ -64,7 +60,8 @@ export function createBot(
   db: AppDatabase,
   configService: ConfigService,
   trafficService: TrafficService,
-  serverManager: ServerManager
+  serverManager: ServerManager,
+  vkApi?: VkApiClient
 ): BotApplication {
   const bot = new Bot(
     appConfig.botToken,
@@ -81,7 +78,7 @@ export function createBot(
   );
   const broadcastDrafts = new Map<
     string,
-    { text: string; entities?: MessageEntity[] }
+    { text: string; audience: BroadcastAudience; entities?: MessageEntity[] }
   >();
   let broadcastRunning = false;
   const allFilesLocks = new Set<string>();
@@ -154,6 +151,24 @@ export function createBot(
       return;
     }
 
+    if (pending.kind === "mass-extension") {
+      if (!isAdmin(ctx, appConfig)) return;
+      const days = parseExtensionDays(ctx.message.text);
+      if (days === null) {
+        pendingInputs.set(telegramId, pending);
+        await ctx.reply("Введите целое количество дней от 1 до 3650, например 15.", {
+          reply_markup: new InlineKeyboard().text("❌ Отмена", "a"),
+        });
+        return;
+      }
+      const count = await db.countExtendableConfigs();
+      await ctx.reply(
+        `Подтвердите массовое продление.\n\nКонфигов: ${count}\nДобавить каждому: ${days} дн.\n\nОтменить это действие автоматически будет нельзя.`,
+        { reply_markup: new InlineKeyboard().text(`✅ Добавить ${days} дн.`, `axc|${days}d`).row().text("❌ Отмена", "ax") }
+      );
+      return;
+    }
+
     if (pending.kind === "broadcast") {
       if (!isAdmin(ctx, appConfig)) return;
       const message = ctx.message.text;
@@ -164,13 +179,24 @@ export function createBot(
         });
         return;
       }
+      const vkText = vkBroadcastText(message, ctx.message.entities);
+      if (pending.audience !== "telegram" && vkText.length > 4096) {
+        pendingInputs.set(telegramId, pending);
+        await ctx.reply("Для VK текст вместе с адресами ссылок должен быть не длиннее 4096 символов. Сократите сообщение.", {
+          reply_markup: new InlineKeyboard().text("❌ Отмена", "bca"),
+        });
+        return;
+      }
       broadcastDrafts.set(telegramId, {
         text: message,
+        audience: pending.audience,
         ...(ctx.message.entities ? { entities: ctx.message.entities } : {}),
       });
-      const recipients = await db.listBroadcastRecipients(telegramId);
+      const counts = await Promise.all(broadcastChannels(pending.audience).map(async channel =>
+        `${channel === "telegram" ? "Telegram" : "VK"}: ${(await db.listBroadcastTargets(channel, telegramId)).length}`
+      ));
       await ctx.reply(
-        `📣 Предпросмотр рассылки\n\nПолучателей: ${recipients.length}\nСледующее сообщение будет отправлено без изменений:`,
+        `📣 Предпросмотр рассылки\n\nПолучателей по каналам:\n${counts.join("\n")}\n${pending.audience === "both" ? "Связанные аккаунты получат сообщение в обоих каналах.\n" : ""}${pending.audience !== "telegram" ? "В VK текст отправится без Telegram-форматирования.\n" : ""}\nТекст сообщения:`,
         {
           reply_markup: new InlineKeyboard().text("❌ Отменить", "bca"),
         }
@@ -184,6 +210,10 @@ export function createBot(
           .row()
           .text("❌ Отменить", "bca"),
       });
+      if (pending.audience !== "telegram" && vkText !== message) {
+        await ctx.reply("Предпросмотр VK: ссылки будут добавлены в текст.");
+        await ctx.reply(vkText);
+      }
       return;
     }
 
@@ -681,11 +711,12 @@ export function createBot(
 
   bot.callbackQuery("ax", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    pendingInputs.set(String(ctx.from.id), { kind: "mass-extension" });
     const count = await db.countExtendableConfigs();
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      `⏳ Массовое продление\n\nБудут продлены ${count} действующих конфигов. Просроченные и отозванные конфиги не изменятся.\n\nСрок прибавляется к текущей дате окончания каждого конфига.`,
+      `⏳ Массовое продление\n\nБудут продлены ${count} действующих конфигов. Просроченные и отозванные конфиги не изменятся.\n\nСрок прибавляется к текущей дате окончания каждого конфига.\n\nВыберите срок кнопкой или отправьте своё количество дней числом (от 1 до 3650).`,
       new InlineKeyboard()
         .text("+7 дней", "axp|7d")
         .text("+1 месяц", "axp|1m")
@@ -701,8 +732,9 @@ export function createBot(
 
   bot.callbackQuery(/^axp\|(7d|1m|3m|6m|1y)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    const code = ctx.match[1] as MassExtensionCode;
-    const period = MASS_EXTENSION_PERIODS[code];
+    pendingInputs.delete(String(ctx.from.id));
+    const code = ctx.match[1]!;
+    const period = massExtensionPeriod(code)!;
     const count = await db.countExtendableConfigs();
     await ctx.answerCallbackQuery();
     await edit(
@@ -715,13 +747,14 @@ export function createBot(
     );
   });
 
-  bot.callbackQuery(/^axc\|(7d|1m|3m|6m|1y)$/, async (ctx) => {
+  bot.callbackQuery(/^axc\|(\d+d|1m|3m|6m|1y)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const lockKey = "mass-extension";
     if (operationLocks.has(lockKey))
       return showAlert(ctx, "Массовое продление уже выполняется.");
-    const code = ctx.match[1] as MassExtensionCode;
-    const period = MASS_EXTENSION_PERIODS[code];
+    const period = massExtensionPeriod(ctx.match[1]!);
+    if (!period) return showAlert(ctx, "Недопустимый срок продления.");
+    pendingInputs.delete(String(ctx.from.id));
     operationLocks.add(lockKey);
     await ctx.answerCallbackQuery({ text: "Продлеваю конфиги…" });
     try {
@@ -872,12 +905,30 @@ export function createBot(
       return showAlert(ctx, "Предыдущая рассылка ещё выполняется.");
     const telegramId = String(ctx.from.id);
     broadcastDrafts.delete(telegramId);
-    pendingInputs.set(telegramId, { kind: "broadcast" });
+    pendingInputs.delete(telegramId);
     await ctx.answerCallbackQuery();
+    const channelsKeyboard = new InlineKeyboard().text("Telegram", "bct|telegram").row();
+    if (vkApi) channelsKeyboard.text("VK", "bct|vk").text("VK и Telegram", "bct|both").row();
+    channelsKeyboard.text("❌ Отмена", "bca");
     await edit(
       ctx,
-      "📣 Отправьте текст сообщения для рассылки. После этого бот покажет предпросмотр и попросит подтверждение.",
-      new InlineKeyboard().text("❌ Отмена", "bca")
+      `📣 Выберите каналы рассылки.${vkApi ? "" : "\n\nVK не подключён, доступен только Telegram."}`,
+      channelsKeyboard
+    );
+  });
+
+  bot.callbackQuery(/^bct\|(telegram|vk|both)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (broadcastRunning) return showAlert(ctx, "Предыдущая рассылка ещё выполняется.");
+    const audience = ctx.match[1] as BroadcastAudience;
+    if (audience !== "telegram" && !vkApi) return showAlert(ctx, "VK не подключён.");
+    const telegramId = String(ctx.from.id);
+    broadcastDrafts.delete(telegramId);
+    pendingInputs.set(telegramId, { kind: "broadcast", audience });
+    await ctx.answerCallbackQuery();
+    await edit(ctx,
+      `📣 Каналы: ${broadcastChannels(audience).map(channel => channel === "vk" ? "VK" : "Telegram").join(" и ")}.\n\nОтправьте текст сообщения. Затем Вы увидите предпросмотр и сможете выбрать отправку с кнопкой файлов или без неё.`,
+      new InlineKeyboard().text("⬅️ Выбор каналов", "bc").row().text("❌ Отмена", "bca")
     );
   });
 
@@ -902,45 +953,54 @@ export function createBot(
     broadcastRunning = true;
     broadcastDrafts.delete(telegramId);
     pendingInputs.delete(telegramId);
-    await ctx.answerCallbackQuery({ text: "Рассылка запущена." });
-    await edit(
-      ctx,
-      "⏳ Рассылка выполняется. Ошибки отдельных пользователей не остановят отправку. По завершении Вы получите отчёт.",
-      new InlineKeyboard().text("🛠 Админ-панель", "a")
-    );
+    try {
+      await ctx.answerCallbackQuery({ text: "Рассылка запущена." });
+      await edit(
+        ctx,
+        "⏳ Рассылка выполняется. Ошибки отдельных пользователей не остановят отправку. По завершении Вы получите отчёт.",
+        new InlineKeyboard().text("🛠 Админ-панель", "a")
+      );
+    } catch (error) {
+      broadcastRunning = false;
+      throw error;
+    }
 
     void (async () => {
       try {
-        const recipients = await db.listBroadcastRecipients(telegramId);
-        const report = await broadcastText(
-          recipients,
-          draft.text,
-          async (recipientId, text) => {
-            await bot.api.sendMessage(recipientId, text, {
-              ...(draft.entities ? { entities: draft.entities } : {}),
-              ...(includeFilesButton
-                ? {
-                    reply_markup: new InlineKeyboard().text(
-                      "📦 Получить все новые файлы",
-                      "dla"
-                    ),
-                  }
-                : {}),
-            });
+        // A failure of one channel must not prevent delivery on the other.
+        const reports: string[] = [];
+        for (const channel of broadcastChannels(draft.audience)) {
+          try {
+            const recipients = await db.listBroadcastTargets(channel, telegramId);
+            const report = await broadcastText(recipients, channel === "vk" ? vkBroadcastText(draft.text, draft.entities) : draft.text, async (recipientId, text) => {
+              if (channel === "vk") {
+                if (!vkApi) throw new Error("VK не подключён");
+                await vkApi.sendMessage({
+                  peerId: Number(recipientId), message: text,
+                  ...(includeFilesButton ? { keyboard: vkKeyboard([[{
+                    label: "📦 Получить все новые файлы", action: { a: "all" }, color: "primary",
+                  }]]) } : {}),
+                });
+              } else {
+                await bot.api.sendMessage(recipientId, text, {
+                  ...(draft.entities ? { entities: draft.entities } : {}),
+                  ...(includeFilesButton ? { reply_markup: new InlineKeyboard().text("📦 Получить все новые файлы", "dla") } : {}),
+                });
+              }
+            }, { channel });
+            reports.push(...formatBroadcastReport(channel, report));
+          } catch (error) {
+            logError(error);
+            reports.push(`❌ ${channel === "vk" ? "VK" : "Telegram"}: не удалось выполнить рассылку из-за общей ошибки.`);
           }
-        );
-        await bot.api.sendMessage(
-          telegramId,
-          [
-            "✅ Рассылка завершена",
-            "",
-            `👥 Получателей: ${report.total}`,
-            `✅ Доставлено: ${report.delivered}`,
-            `🚫 Бот заблокирован или чат недоступен: ${report.unavailable}`,
-            `⚠️ Другие ошибки: ${report.failed}`,
-          ].join("\n"),
-          { reply_markup: new InlineKeyboard().text("🛠 Админ-панель", "a") }
-        );
+        }
+        for (const report of reports) {
+          await sendWithRateLimitRetry(telegramId, report, async (id, text) => {
+            await bot.api.sendMessage(id, text, {
+              reply_markup: new InlineKeyboard().text("🛠 Админ-панель", "a"),
+            });
+          });
+        }
       } catch (error) {
         logError(error);
         await bot.api

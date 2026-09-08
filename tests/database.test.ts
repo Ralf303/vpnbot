@@ -59,6 +59,9 @@ describe("AppDatabase с Prisma", () => {
     const stats = await db.stats();
     expect(stats.telegramUsers).toBe(2);
     expect(stats.linkedVkUsers).toBe(1);
+    expect(await db.listBroadcastTargets("telegram", "200")).toEqual([{ id: "100", username: null }]);
+    expect(await db.listBroadcastTargets("vk", "200")).toEqual([{ id: "701", peerId: "701", username: null }]);
+    expect(await db.listBroadcastTargets("vk", "100")).toEqual([]);
   });
 
   it("создаёт отдельного VK-пользователя без фиктивного Telegram ID", async () => {

@@ -18,11 +18,12 @@ const vpn = new OpenVpnGateway(config.envServers, (key) =>
 const serverManager = new ServerManager(db, vpn, config);
 const configService = new ConfigService(db, vpn, serverManager, config.vpnProfile);
 const trafficService = new TrafficService(db, vpn, serverManager);
-const { bot } = createBot(config, db, configService, trafficService, serverManager);
+const vkApi = config.vk ? new VkApiClient(config.vk.token, config.vk.groupId) : undefined;
+const { bot } = createBot(config, db, configService, trafficService, serverManager, vkApi);
 const jobs = new BackgroundJobs(bot, db, vpn, config, trafficService, serverManager);
-const vkBot = config.vk
+const vkBot = vkApi
   ? new VkBot(
-      new VkApiClient(config.vk.token, config.vk.groupId),
+      vkApi,
       db,
       configService,
       trafficService,

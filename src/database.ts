@@ -1,5 +1,6 @@
 import { PrismaPg } from "@prisma/adapter-pg";
 import { DateTime } from "luxon";
+import type { BroadcastChannel, BroadcastRecipient } from "./broadcast-service.js";
 import type {
   User,
   VpnConfig,
@@ -240,6 +241,27 @@ export class AppDatabase {
       select: { telegramId: true },
     });
     return rows.flatMap(({ telegramId }) => telegramId ? [telegramId] : []);
+  }
+
+  async listBroadcastTargets(channel: BroadcastChannel, excludedTelegramId: string): Promise<BroadcastRecipient[]> {
+    if (channel === "telegram") {
+      const users = await this.prisma.user.findMany({
+        where: { telegramId: { not: excludedTelegramId } },
+        orderBy: { id: "asc" },
+        select: { telegramId: true, username: true },
+      });
+      return users.flatMap(user => user.telegramId ? [{ id: user.telegramId, username: user.username }] : []);
+    }
+    const identities = await this.prisma.messengerIdentity.findMany({
+      where: { provider: "vk", user: { telegramId: { not: excludedTelegramId } } },
+      orderBy: { id: "asc" },
+      select: { externalId: true, peerId: true, username: true },
+    });
+    return identities.map(identity => ({
+      id: identity.externalId,
+      peerId: identity.peerId ?? identity.externalId,
+      username: identity.username,
+    }));
   }
 
   async createAccountLinkToken(input: {
