@@ -3,6 +3,9 @@ set -Eeuo pipefail
 
 readonly nft_config="/etc/vpnbot-geo-routing.nft"
 readonly comment="vpnbot-geo-routing"
+[[ ! -r /etc/default/vpnbot-routing ]] || source /etc/default/vpnbot-routing
+readonly interface="${VPN_EGRESS_INTERFACE:-wg-vpnbot}"
+readonly mss="${VPN_EGRESS_MSS:-1380}"
 
 add_rule() {
   local table="$1"
@@ -27,6 +30,8 @@ case "${1:-}" in
     /usr/local/sbin/vpnbot-update-ru-routes
     add_rule filter DOCKER-USER -i tun1 -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
     add_rule filter DOCKER-USER -o tun1 -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    add_rule mangle FORWARD -i tun1 -o "$interface" -p tcp --tcp-flags SYN,RST SYN -m tcpmss --mss "$((mss + 1)):65535" -m comment --comment "$comment" -j TCPMSS --set-mss "$mss"
+    add_rule mangle FORWARD -i "$interface" -o tun1 -p tcp --tcp-flags SYN,RST SYN -m tcpmss --mss "$((mss + 1)):65535" -m comment --comment "$comment" -j TCPMSS --set-mss "$mss"
     /usr/local/sbin/vpnbot-route-health
     ;;
   down)
@@ -37,6 +42,8 @@ case "${1:-}" in
     nft delete table inet vpnbot_geo 2>/dev/null || true
     delete_rule filter DOCKER-USER -i tun1 -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
     delete_rule filter DOCKER-USER -o tun1 -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    delete_rule mangle FORWARD -i tun1 -o "$interface" -p tcp --tcp-flags SYN,RST SYN -m tcpmss --mss "$((mss + 1)):65535" -m comment --comment "$comment" -j TCPMSS --set-mss "$mss"
+    delete_rule mangle FORWARD -i "$interface" -o tun1 -p tcp --tcp-flags SYN,RST SYN -m tcpmss --mss "$((mss + 1)):65535" -m comment --comment "$comment" -j TCPMSS --set-mss "$mss"
     ;;
   *)
     echo "Использование: $0 up|down" >&2

@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 
 readonly comment="vpnbot-finland-egress"
+[[ ! -r /etc/default/vpnbot-routing ]] || source /etc/default/vpnbot-routing
+readonly interface="${VPN_EGRESS_INTERFACE:-wg-vpnbot}"
 
 add_rule() {
   local table="$1"
@@ -21,15 +23,15 @@ delete_rule() {
 
 case "${1:-}" in
   up)
-    ip -4 route replace 10.9.0.0/24 dev wg-vpnbot
-    add_rule filter FORWARD -i wg-vpnbot -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
-    add_rule filter FORWARD -o wg-vpnbot -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    ip -4 route replace 10.9.0.0/24 dev "$interface"
+    add_rule filter FORWARD -i "$interface" -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
+    add_rule filter FORWARD -o "$interface" -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
     add_rule nat POSTROUTING -s 10.9.0.0/24 -o ens3 -m comment --comment "$comment" -j MASQUERADE
     ;;
   down)
-    ip -4 route del 10.9.0.0/24 dev wg-vpnbot 2>/dev/null || true
-    delete_rule filter FORWARD -i wg-vpnbot -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
-    delete_rule filter FORWARD -o wg-vpnbot -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    ip -4 route del 10.9.0.0/24 dev "$interface" 2>/dev/null || true
+    delete_rule filter FORWARD -i "$interface" -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
+    delete_rule filter FORWARD -o "$interface" -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
     delete_rule nat POSTROUTING -s 10.9.0.0/24 -o ens3 -m comment --comment "$comment" -j MASQUERADE
     ;;
   *)

@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN transit interface (%i)
+After=network-online.target
+Wants=network-online.target
+Before=ssh.service vpnbot-transit.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-transit-interface %i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+# Install as /etc/default/vpnbot-routing on both production servers.
+# Without this file the routing scripts retain their WireGuard defaults.
+VPN_EGRESS_INTERFACE=tun99
+VPN_EGRESS_PEER=10.211.0.2
+VPN_EGRESS_MSS=1360

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+role="${1:?Usage: vpnbot-transit-interface ru|fi}"
+case "$role" in
+  ru) address="10.211.0.1/30"; owner="vpn-transit" ;;
+  fi) address="10.211.0.2/30"; owner="root" ;;
+  *) exit 2 ;;
+esac
+
+if ! ip link show tun99 >/dev/null 2>&1; then
+  ip tuntap add dev tun99 mode tun user "$owner"
+fi
+ip address replace "$address" dev tun99
+ip link set tun99 mtu 1400 up
+sysctl -q -w net.ipv4.conf.tun99.rp_filter=2

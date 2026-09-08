@@ -1,0 +1,20 @@
+[Unit]
+Description=Finland to Moscow SSH tunnel for VPN transit
+After=network-online.target vpnbot-transit-interface@fi.service
+Wants=network-online.target
+Requires=vpnbot-transit-interface@fi.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/vpnbot-transit
+ExecStart=/usr/bin/ssh -NT -4 -w 99:99 -i /etc/vpnbot-transit/id_ed25519 -o Tunnel=point-to-point -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/vpnbot-transit/known_hosts -o Compression=no vpn-transit@${VPN_TRANSIT_RU_HOST}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/vpnbot-transit
+
+[Install]
+WantedBy=multi-user.target

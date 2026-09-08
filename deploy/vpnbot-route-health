@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly interface="wg-vpnbot"
-readonly peer="10.210.0.2"
+[[ ! -r /etc/default/vpnbot-routing ]] || source /etc/default/vpnbot-routing
+readonly interface="${VPN_EGRESS_INTERFACE:-wg-vpnbot}"
+readonly peer="${VPN_EGRESS_PEER:-10.210.0.2}"
 readonly mark="0x210"
 readonly table="210"
 readonly preference="10210"
