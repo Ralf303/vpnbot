@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+[[ ! -r /etc/default/vpnbot-routing ]] || source /etc/default/vpnbot-routing
+readonly interface="${VPN_EGRESS_INTERFACE:-wg-de}"
+readonly external="${VPN_EGRESS_EXTERNAL_INTERFACE:-ens3}"
+readonly subnet="${VPN_CLIENT_SUBNET:-10.9.0.0/24}"
+readonly comment="vpnbot-egress"
+
+rule() {
+  local action="$1" table="$2"
+  shift 2
+  if [[ "$action" == up ]]; then
+    iptables -w 5 -t "$table" -C "$@" 2>/dev/null || iptables -w 5 -t "$table" -I "$@"
+  else
+    while iptables -w 5 -t "$table" -C "$@" 2>/dev/null; do
+      iptables -w 5 -t "$table" -D "$@"
+    done
+  fi
+}
+
+case "${1:-}" in
+  up)
+    ip -4 route replace "$subnet" dev "$interface"
+    sysctl -q -w "net.ipv4.conf.${interface}.rp_filter=2"
+    ;;
+  down)
+    ip -4 route del "$subnet" dev "$interface" 2>/dev/null || true
+    ;;
+  *) echo "Usage: vpnbot-egress up|down" >&2; exit 2 ;;
+esac
+
+rule "$1" filter FORWARD -i "$interface" -s "$subnet" -m comment --comment "$comment" -j ACCEPT
+rule "$1" filter FORWARD -o "$interface" -d "$subnet" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+rule "$1" nat POSTROUTING -s "$subnet" -o "$external" -m comment --comment "$comment" -j MASQUERADE

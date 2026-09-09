@@ -1,0 +1,10 @@
+[Unit]
+Description=Private SOCKS socket for the VPN bot
+
+[Socket]
+ListenStream=172.30.0.1:1081
+FreeBind=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

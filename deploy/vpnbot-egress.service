@@ -1,0 +1,15 @@
+[Unit]
+Description=Foreign egress for VPN traffic via Germany
+After=network-online.target wg-quick@wg-de.service
+Wants=network-online.target
+Requires=wg-quick@wg-de.service
+PartOf=wg-quick@wg-de.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-egress up
+ExecStop=/usr/local/sbin/vpnbot-egress down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

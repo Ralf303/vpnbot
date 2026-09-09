@@ -1,0 +1,14 @@
+# /etc/wireguard/wg-de.conf, mode 0600. Generate separate keys on each server.
+[Interface]
+Address = 10.212.0.2/30
+ListenPort = 51822
+MTU = 1400
+Table = off
+PostUp = sysctl -q -w net.ipv4.conf.%i.rp_filter=2
+PrivateKey = <DE_PRIVATE_KEY>
+
+[Peer]
+PublicKey = <RU_PUBLIC_KEY>
+AllowedIPs = 10.212.0.1/32, 10.9.0.0/24
+Endpoint = <RU_PUBLIC_IP>:51822
+PersistentKeepalive = 15

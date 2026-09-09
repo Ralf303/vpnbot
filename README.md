@@ -4,7 +4,8 @@
 
 Документация проекта:
 
-- [NETWORK_RECOVERY_2026-09-08.md](NETWORK_RECOVERY_2026-09-08.md) — текущий SSH/TCP-транспорт Москва–Финляндия, результаты проверки и откат;
+- [NETWORK_FAILOVER_2026-09-09.md](NETWORK_FAILOVER_2026-09-09.md) — текущий выход через Германию по WireGuard, сохранение конфигов и порядок восстановления;
+- [NETWORK_RECOVERY_2026-09-08.md](NETWORK_RECOVERY_2026-09-08.md) — история временного SSH/TCP-транспорта Москва–Финляндия;
 - [DEPLOYMENT_RUNBOOK.md](DEPLOYMENT_RUNBOOK.md) — воспроизводимый первый запуск, обновление, приёмка, диагностика и откат;
 - [BOT_INTERNALS.md](BOT_INTERNALS.md) — внутренняя логика бота, модель данных, жизненный цикл конфигов, меню и фоновые задания;
 - [SERVER_INFRASTRUCTURE.md](SERVER_INFRASTRUCTURE.md) — полная серверная схема и пошаговое воспроизведение на новых VPS;

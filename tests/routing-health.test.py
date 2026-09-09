@@ -12,15 +12,21 @@ SOURCE = Path(sys.argv.pop(1) if len(sys.argv) > 1 else "deploy/vpnbot-route-hea
 
 class RoutingHealthTest(unittest.TestCase):
     def test_route_selection_and_fallback(self):
-        for configured, available, initial_rule in [
-            (False, True, False), (True, True, False), (True, True, True),
-            (True, False, True), (True, False, False),
-        ]:
+        cases = [(False, True, False)] + [
+            (transport, available, initial_rule)
+            for transport in ("ssh", "germany")
+            for available, initial_rule in ((True, False), (True, True), (False, True), (False, False))
+        ]
+        for configured, available, initial_rule in cases:
             with self.subTest(configured=configured, available=available, initial_rule=initial_rule):
                 with tempfile.TemporaryDirectory(prefix="vpnbot-health-test-") as directory:
                     root = Path(directory)
                     config = root / "routing.defaults"
-                    interface, peer = ("tun99", "10.211.0.2") if configured else ("wg-vpnbot", "10.210.0.2")
+                    interface, peer = {
+                        False: ("wg-vpnbot", "10.210.0.2"),
+                        "ssh": ("tun99", "10.211.0.2"),
+                        "germany": ("wg-de", "10.212.0.2"),
+                    }[configured]
                     if configured:
                         config.write_text(f"VPN_EGRESS_INTERFACE={interface}\nVPN_EGRESS_PEER={peer}\n")
                     script = root / "health"
