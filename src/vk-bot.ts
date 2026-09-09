@@ -4,6 +4,8 @@ import type { ConfigService } from "./config-service.js";
 import type { UserRecord, VpnConfigRecord } from "./domain.js";
 import { labeledVpnFileName, vpnFileName } from "./file-name.js";
 import type { ServerManager } from "./server-manager.js";
+import type { EgressService } from "./egress-service.js";
+import { EgressAdmin, type EmergencyReply } from "./egress-admin.js";
 import { formatDate, isExpired } from "./time.js";
 import type { TrafficService } from "./traffic-service.js";
 import {
@@ -54,6 +56,7 @@ export class VkBot {
   private readonly profiles = new Map<number, VkUserProfile>();
   private readonly pendingRename = new Map<string, string>();
   private readonly operationLocks = new Set<string>();
+  private readonly emergency: EgressAdmin | undefined;
 
   constructor(
     private readonly api: VkApiClient,
@@ -61,8 +64,20 @@ export class VkBot {
     private readonly configService: ConfigService,
     private readonly trafficService: TrafficService,
     private readonly serverManager: ServerManager,
-    private readonly timezone: string
-  ) {}
+    private readonly timezone: string,
+    private readonly options: { egress?: EgressService | undefined; adminTelegramId?: string | undefined; adminVkId?: string | undefined } = {}
+  ) { this.emergency = options.egress ? new EgressAdmin(options.egress) : undefined; }
+
+  private async isEmergencyAdmin(vkId: number, peerId: number): Promise<boolean> {
+    if (vkId !== peerId || !this.emergency) return false;
+    if (this.options.adminVkId === String(vkId)) return true;
+    const user = await this.db.getUserByVkId(String(vkId));
+    return Boolean(this.options.adminTelegramId && user?.telegramId === this.options.adminTelegramId);
+  }
+
+  private emergencyReply(peerId: number): EmergencyReply {
+    return async (message, rows) => { await this.api.sendMessage({ peerId, message, keyboard: keyboard(rows) }); };
+  }
 
   async start(): Promise<void> {
     if (this.abortController) throw new Error("VK-бот уже запущен");
@@ -135,6 +150,15 @@ export class VkBot {
   }
 
   private async handleMessage(message: VkMessage): Promise<void> {
+    const actor = `vk:${message.from_id}`;
+    if (this.emergency && await this.isEmergencyAdmin(message.from_id, message.peer_id)) {
+      const adminAction = parseAction(message.payload);
+      if (adminAction?.a.startsWith("eg_")) { await this.emergency.action(actor, adminAction, this.emergencyReply(message.peer_id)); return; }
+      if (this.emergency.waiting(actor)) { await this.emergency.text(actor, message.text, this.emergencyReply(message.peer_id)); return; }
+      if (["/admin", "админ", "авария"].includes(message.text.trim().toLowerCase())) {
+        await this.emergency.action(actor, { a: "eg_list" }, this.emergencyReply(message.peer_id)); return;
+      }
+    }
     const profile = await this.profile(message.from_id);
     let user = await this.db.upsertVkUser({
       vkId: String(message.from_id),
@@ -217,6 +241,12 @@ export class VkBot {
     action: VkAction | null,
     conversationMessageId?: number
   ): Promise<void> {
+    if (action?.a.startsWith("eg_")) {
+      if (!this.emergency || !(await this.isEmergencyAdmin(vkId, peerId))) {
+        await this.api.sendMessage({ peerId, message: "Недостаточно прав. Аварийное управление доступно только администратору в личном чате." }); return;
+      }
+      await this.emergency.action(`vk:${vkId}`, action, this.emergencyReply(peerId)); return;
+    }
     const user = await this.db.getUserByVkId(String(vkId));
     if (!user || vkRequiresTelegramLink(user)) {
       return this.showLinkRequired(peerId, conversationMessageId);
@@ -263,8 +293,16 @@ export class VkBot {
     if (action.a === "reissue") {
       return this.showReissueServers(config, peerId, conversationMessageId);
     }
+    if (action.a === "exit-page") return this.showReissueServers(config, peerId, conversationMessageId, action.page ?? 0);
     if (action.a === "reissue-confirm" && action.server) {
       return this.reissue(config, action.server, peerId);
+    }
+    if (action.a === "exit-confirm" && action.server && action.page !== undefined && this.options.egress) {
+      try {
+        await this.options.egress.assign(config, action.server, action.page);
+        await this.api.sendMessage({ peerId, message: "✅ Выход переключён. Файл и срок действия сохранены. Если открытое соединение прервалось, переподключите VPN.", keyboard: configKeyboard(config.id) });
+      } catch (error) { await this.api.sendMessage({ peerId, message: error instanceof Error ? error.message : "Выход не переключён.", keyboard: configKeyboard(config.id) }); }
+      return;
     }
   }
 
@@ -275,8 +313,8 @@ export class VkBot {
     await this.sendOrEdit({
       peerId,
       conversationMessageId,
-      message: "👋 VPN-бот\n\nЗдесь можно получить конфиги, проверить срок действия и перевыпустить файл.",
-      keyboard: mainKeyboard(),
+      message: "👋 VPN-бот\n\nЗдесь можно получить конфиги, проверить срок действия и сменить сервер выхода.",
+      keyboard: mainKeyboard(await this.isEmergencyAdmin(peerId, peerId)),
     });
   }
 
@@ -339,10 +377,15 @@ export class VkBot {
     peerId: number,
     conversationMessageId?: number
   ): Promise<void> {
-    const [traffic, serverName] = await Promise.all([
+    const [traffic, entryName] = await Promise.all([
       this.trafficService.forConfig(config),
       this.serverManager.serverName(config.serverKey),
     ]);
+    let serverName = entryName;
+    if (this.options.egress?.manages(config)) {
+      const state = await this.options.egress.snapshot().catch(() => null);
+      serverName = state ? state.nodes.find(n => n.id === (state.assignments[config.clientName] ?? state.default))?.name ?? "Неизвестный выход" : "Статус выхода недоступен";
+    }
     const active = config.status === "active" && !isExpired(config.expiresAt);
     await this.sendOrEdit({
       peerId,
@@ -445,8 +488,23 @@ export class VkBot {
   private async showReissueServers(
     config: VpnConfigRecord,
     peerId: number,
-    conversationMessageId?: number
+    conversationMessageId?: number,
+    requestedPage = 0
   ): Promise<void> {
+    if (this.options.egress?.manages(config)) {
+      try {
+        const state = await this.options.egress.snapshot();
+        const selected = await this.options.egress.configExit(config, state);
+        const choices = state.nodes.filter(n => n.status === "ready" && n.id !== selected);
+        const page = Math.max(0, Math.min(requestedPage, Math.ceil(choices.length / 4) - 1));
+        await this.sendOrEdit({ peerId, conversationMessageId,
+          message: choices.length ? "Выберите зарубежный выход. Файл и срок действия останутся прежними; открытые соединения могут прерваться." : "Сейчас нет другого готового зарубежного выхода.",
+          keyboard: keyboard([...choices.slice(page * 4, page * 4 + 4).map(n => [button(n.name, { a: "exit-confirm", id: config.id, server: n.id, page: state.revision }, "primary")]),
+            ...(choices.length > 4 ? [[button("←", { a: "exit-page", id: config.id, page: Math.max(0, page - 1) }), button("→", { a: "exit-page", id: config.id, page: page + 1 })]] : []),
+            [button("Назад", { a: "cfg", id: config.id })]]) });
+      } catch { await this.api.sendMessage({ peerId, message: "Не удалось получить список выходов. Текущий конфиг не изменён." }); }
+      return;
+    }
     if (config.status !== "active" || isExpired(config.expiresAt)) {
       await this.sendOrEdit({
         peerId,
@@ -493,6 +551,8 @@ export class VkBot {
     serverKey: string,
     peerId: number
   ): Promise<void> {
+    // Old inline messages must not recreate certificates for the Moscow entry.
+    if (this.options.egress?.manages(config)) return this.showReissueServers(config, peerId);
     const lock = `reissue:${config.id}`;
     if (this.operationLocks.has(lock)) return;
     this.operationLocks.add(lock);
@@ -574,11 +634,12 @@ export function vkRequiresTelegramLink(
   return !user?.telegramId;
 }
 
-function mainKeyboard(): string {
+function mainKeyboard(admin = false): string {
   return keyboard([
     [button("🔐 Мои конфиги", { a: "list" }, "primary")],
     [button("📦 Получить все файлы", { a: "all" }, "positive")],
     [button("ℹ️ Помощь", { a: "help" })],
+    ...(admin ? [[button("🛠 Аварийное управление", { a: "eg_list" })]] : []),
   ]);
 }
 
@@ -612,7 +673,7 @@ function configKeyboard(configId: string, active = true): string {
       button("📥 Получить файл", { a: "download", id: configId }, "positive"),
     ]);
     rows.push([
-      button("🔄 Перевыпустить", { a: "reissue", id: configId }, "primary"),
+      button("🌍 Сменить сервер", { a: "reissue", id: configId }, "primary"),
       button("✏️ Переименовать", { a: "rename", id: configId }),
     ]);
   }

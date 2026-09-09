@@ -1,0 +1,7 @@
+[Unit]
+Description=Reconcile VPN client address mappings
+After=vpnbot-egress-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-egress-control tick

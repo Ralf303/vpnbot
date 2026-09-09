@@ -7,6 +7,8 @@ import type { AppConfig } from "./config.js";
 import { broadcastText, broadcastChannels, formatBroadcastReport, vkBroadcastText, sendWithRateLimitRetry, type BroadcastAudience } from "./broadcast-service.js";
 import { massExtensionPeriod, parseExtensionDays } from "./mass-extension.js";
 import type { VkApiClient } from "./vk-api.js";
+import type { EgressService } from "./egress-service.js";
+import { EgressAdmin, type EmergencyReply } from "./egress-admin.js";
 import { keyboard as vkKeyboard } from "./vk-bot.js";
 import { ConfigService } from "./config-service.js";
 import { AppDatabase } from "./database.js";
@@ -61,7 +63,8 @@ export function createBot(
   configService: ConfigService,
   trafficService: TrafficService,
   serverManager: ServerManager,
-  vkApi?: VkApiClient
+  vkApi?: VkApiClient,
+  egress?: EgressService
 ): BotApplication {
   const bot = new Bot(
     appConfig.botToken,
@@ -82,6 +85,57 @@ export function createBot(
   >();
   let broadcastRunning = false;
   const allFilesLocks = new Set<string>();
+  const emergency = egress ? new EgressAdmin(egress) : undefined;
+  const emergencyReply = (ctx: Context): EmergencyReply => async (text, rows) => {
+    const keys = new InlineKeyboard();
+    for (const row of rows) { for (const item of row) keys.text(item.label, [item.action.a, item.action.id ?? "", item.action.server ?? "", item.action.page ?? ""].join("|")); keys.row(); }
+    keys.text("Админ-панель", "a");
+    await ctx.reply(text, { reply_markup: keys });
+  };
+  bot.use(async (ctx, next) => {
+    const actor = `tg:${ctx.from?.id}`;
+    if (emergency?.waiting(actor) && ctx.message?.text && isAdmin(ctx, appConfig) && ctx.chat?.type === "private") {
+      await emergency.text(actor, ctx.message.text, emergencyReply(ctx)); return;
+    }
+    await next();
+  });
+  bot.callbackQuery(/^eg_/, async ctx => {
+    if (!emergency || !isAdmin(ctx, appConfig) || ctx.chat?.type !== "private") return showAlert(ctx, "Аварийное управление недоступно.");
+    await ctx.answerCallbackQuery();
+    const [a = "eg_list", id, server, page] = ctx.callbackQuery.data.split("|");
+    await emergency.action(`tg:${ctx.from.id}`, { a, ...(id ? { id } : {}), ...(server ? { server } : {}), ...(page ? { page: Number(page) } : {}) }, emergencyReply(ctx));
+  });
+  async function showExitChoices(ctx: Context, config: VpnConfigRecord, requestedPage = 0): Promise<void> {
+    if (!egress) return;
+    try {
+      const state = await egress.snapshot();
+      const current = await egress.configExit(config, state);
+      const choices = state.nodes.filter(n => n.status === "ready" && n.id !== current);
+      const page = Math.max(0, Math.min(requestedPage, Math.ceil(choices.length / 5) - 1));
+      const keys = new InlineKeyboard();
+      for (const n of choices.slice(page * 5, page * 5 + 5)) keys.text(n.name, `xec|${config.id}|${n.id}|${state.revision}`).row();
+      if (choices.length > 5) keys.text("←", `xep|${config.id}|${Math.max(0, page - 1)}`).text("→", `xep|${config.id}|${page + 1}`).row();
+      keys.text("Назад", `uc|${config.id}`);
+      await ctx.reply(choices.length ? "Выберите зарубежный выход. Файл, сертификат и срок сохранятся; открытые соединения могут прерваться." : "Нет другого готового зарубежного выхода.", { reply_markup: keys });
+    } catch { await ctx.reply("Не удалось получить список выходов. Текущий конфиг сохранён."); }
+  }
+  bot.callbackQuery(/^xep\|([^|]+)\|(\d+)$/, async ctx => {
+    const config = await db.getConfig(ctx.match[1]!);
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
+    if (!egress || !config || (!isAdmin(ctx, appConfig) && config.userId !== user?.id)) return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery();
+    return showExitChoices(ctx, config, Number(ctx.match[2]));
+  });
+  bot.callbackQuery(/^xec\|([^|]+)\|([^|]+)\|(\d+)$/, async ctx => {
+    const config = await db.getConfig(ctx.match[1]!);
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
+    if (!egress || !config || (!isAdmin(ctx, appConfig) && config.userId !== user?.id)) return showAlert(ctx, "Конфиг не найден.");
+    await ctx.answerCallbackQuery();
+    try {
+      await egress.assign(config, ctx.match[2]!, Number(ctx.match[3]));
+      await ctx.reply("✅ Выход переключён. Файл и срок действия сохранены. При необходимости переподключите VPN.");
+    } catch (error) { await ctx.reply(error instanceof Error ? error.message : "Выход не переключён."); }
+  });
 
   serverManager.onBootstrapFinished = (text) => notifyAdmin(bot, appConfig, text);
 
@@ -478,7 +532,7 @@ export function createBot(
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     await ctx.answerCallbackQuery();
-    await showUserConfig(ctx, config, appConfig, trafficService, serverManager);
+    await showUserConfig(ctx, config, appConfig, trafficService, serverManager, egress);
   });
 
   bot.callbackQuery(/^rn\|(.+)$/, async (ctx) => {
@@ -585,6 +639,7 @@ export function createBot(
   bot.callbackQuery(/^rr\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (egress?.manages(config)) { await ctx.answerCallbackQuery(); return showExitChoices(ctx, config); }
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
     const servers = (await serverManager.listServers()).filter(
@@ -615,6 +670,7 @@ export function createBot(
   bot.callbackQuery(/^rrs\|([^|]+)\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (egress?.manages(config)) { await ctx.answerCallbackQuery(); return showExitChoices(ctx, config); }
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
     const server = await serverManager.getServer(ctx.match[2]!);
@@ -636,6 +692,7 @@ export function createBot(
   bot.callbackQuery(/^rrc\|([^|]+)\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (egress?.manages(config)) { await ctx.answerCallbackQuery(); return showExitChoices(ctx, config); }
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
     const server = await serverManager.getServer(ctx.match[2]!);
@@ -781,6 +838,7 @@ export function createBot(
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     pendingInputs.delete(String(ctx.from.id));
     await ctx.answerCallbackQuery();
+    if (emergency && ctx.chat?.type === "private") return emergency.action(`tg:${ctx.from.id}`, { a: "eg_list" }, emergencyReply(ctx));
     await showServersList(ctx, serverManager);
   });
 
@@ -822,6 +880,7 @@ export function createBot(
 
   bot.callbackQuery(/^svd\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (ctx.match[1] === egress?.entryKey) return showAlert(ctx, "Московскую точку входа нельзя удалить из аварийного управления.");
     const server = await serverManager.getServer(ctx.match[1]!);
     if (!server) return showAlert(ctx, "Сервер не найден.");
     const impact = await db.serverDeletionImpact(server.record.key);
@@ -846,6 +905,7 @@ export function createBot(
 
   bot.callbackQuery(/^svdc\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (ctx.match[1] === egress?.entryKey) return showAlert(ctx, "Московскую точку входа нельзя удалить из аварийного управления.");
     const server = await serverManager.getServer(ctx.match[1]!);
     if (!server) return showAlert(ctx, "Сервер уже удалён.");
     const lockKey = `server-delete:${server.record.key}`;
@@ -879,6 +939,7 @@ export function createBot(
 
   bot.callbackQuery("svadd", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (emergency && ctx.chat?.type === "private") { await ctx.answerCallbackQuery(); return emergency.action(`tg:${ctx.from.id}`, { a: "eg_add" }, emergencyReply(ctx)); }
     pendingInputs.set(String(ctx.from.id), { kind: "server-add" });
     await ctx.answerCallbackQuery();
     await edit(
@@ -1079,6 +1140,7 @@ export function createBot(
   bot.callbackQuery(/^am\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const config = await db.getConfig(ctx.match[1]!);
+    if (config && egress?.manages(config)) { await ctx.answerCallbackQuery(); return showExitChoices(ctx, config); }
     if (!config || config.status === "revoked")
       return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
@@ -1108,6 +1170,7 @@ export function createBot(
   bot.callbackQuery(/^amc\|([^|]+)\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const config = await db.getConfig(ctx.match[1]!);
+    if (config && egress?.manages(config)) { await ctx.answerCallbackQuery(); return showExitChoices(ctx, config); }
     const targetServer = await serverManager.getServer(ctx.match[2]!);
     if (!config || config.status === "revoked")
       return showAlert(ctx, "Конфиг не найден.");
@@ -1418,12 +1481,17 @@ async function showUserConfig(
   config: VpnConfigRecord,
   appConfig: AppConfig,
   trafficService: TrafficService,
-  serverManager: ServerManager
+  serverManager: ServerManager,
+  egress?: EgressService
 ): Promise<void> {
   const expired = isExpired(config.expiresAt) || config.status === "expired";
   const status = expired ? "Просрочен" : "Активен";
   const traffic = await trafficService.forConfig(config);
-  const serverName = await serverManager.serverName(config.serverKey);
+  let serverName = await serverManager.serverName(config.serverKey);
+  if (egress?.manages(config)) {
+    const state = await egress.snapshot().catch(() => null);
+    serverName = state ? state.nodes.find(n => n.id === (state.assignments[config.clientName] ?? state.default))?.name ?? "Неизвестный выход" : "Статус выхода недоступен";
+  }
   const keyboard = new InlineKeyboard()
     .text("✏️ Переименовать", `rn|${config.id}`)
     .row();
@@ -1433,7 +1501,7 @@ async function showUserConfig(
     keyboard
       .text("📥 Получить файл", `dl|${config.id}`)
       .row()
-      .text("🔄 Перевыпустить файл", `rr|${config.id}`)
+      .text(egress?.manages(config) ? "🌍 Сменить сервер" : "🔄 Перевыпустить файл", `rr|${config.id}`)
       .row();
   }
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");
@@ -1465,6 +1533,8 @@ async function showAdminMain(
       .text("🔎 Найти пользователя", "as")
       .row()
       .text("🖥 Серверы", "sv")
+      .row()
+      .text("🌍 Аварийное управление", "eg_list")
       .row()
       .text("📣 Рассылка", "bc")
       .row()

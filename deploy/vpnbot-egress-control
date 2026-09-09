@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Root-owned control plane. The bot submits bounded JSON over direct SSH/stdin.
+Passwords exist only in the detached installer's memory; state contains no secrets.
+"""
+import contextlib
+import copy
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import socket
+import socketserver
+import struct
+import pwd
+import subprocess
+import sys
+import time
+
+ROOT = Path('/etc/vpnbot-egress-manager')
+STATE = ROOT / 'state.json'
+RUN = Path('/run/vpnbot-egress-manager')
+STATUS = Path('/run/openvpn-server/server-status-tcp.tsv')
+CLIENT_NET = ipaddress.ip_network('10.9.0.0/24')
+
+class ControlError(Exception):
+    pass
+
+def command(args, input=None, timeout=25):
+    result = subprocess.run(args, input=input, text=True, capture_output=True, timeout=timeout)
+    if result.returncode:
+        raise ControlError('Системная проверка не пройдена: ' + args[0])
+    return result.stdout.strip()
+
+def atomic(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.new')
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temp, mode)
+    os.replace(temp, path)
+
+@contextlib.contextmanager
+def lock(name):
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (RUN / (name + '.lock')).open('w') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+def load():
+    if not STATE.exists():
+        raise ControlError('Управление выходами ещё не настроено на Москве.')
+    return json.loads(STATE.read_text())
+
+def save(state):
+    atomic(STATE, json.dumps(state, ensure_ascii=False))
+
+def node(state, key):
+    if not isinstance(key, str) or not re.fullmatch(r'e[1-9][0-9]{0,2}', key):
+        raise ControlError('Некорректный сервер.')
+    result = next((n for n in state['nodes'] if n['id'] == key), None)
+    if not result:
+        raise ControlError('Сервер не найден.')
+    return result
+
+def client_name(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', value):
+        raise ControlError('Некорректный клиент.')
+    return value
+
+def read_sessions(text):
+    """Read OpenVPN status-version 3 by column names, not assumed positions."""
+    names, sessions = [], {}
+    for line in text.splitlines():
+        fields = line.split('\t')
+        if fields[:2] == ['HEADER', 'CLIENT_LIST']:
+            names = fields[2:]
+        elif fields[:1] == ['CLIENT_LIST'] and names:
+            item = dict(zip(names, fields[1:]))
+            cn, address = item.get('Common Name'), item.get('Virtual Address', '').split(':')[0]
+            try:
+                if cn and ipaddress.ip_address(address) in CLIENT_NET:
+                    sessions[cn] = address
+            except ValueError:
+                pass
+    return sessions
+
+def sessions():
+    current = read_sessions(STATUS.read_text() if STATUS.exists() else '')
+    with lock('sessions'):
+        path = RUN / 'sessions.json'
+        events = json.loads(path.read_text()) if path.exists() else {}
+    for cn, event in events.items():
+        if time.time() - event['time'] < 30:
+            if event['connected']:
+                current[cn] = event['ip']
+            elif current.get(cn) == event['ip']:
+                current.pop(cn, None)
+    return current
+
+def routing_entries(state, connected):
+    nodes = {n['id']: n for n in state['nodes']}
+    result = {}
+    for cn, address in connected.items():
+        chosen = nodes.get(state['assignments'].get(cn, state['default']))
+        if chosen:
+            result[address] = chosen['table']
+    return result
+
+def map_routes(state):
+    entries = routing_entries(state, sessions())
+    digest = hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+    with lock('routes'):
+        fingerprint = RUN / 'map.sha256'
+        if fingerprint.exists() and fingerprint.read_text() == digest:
+            return
+        exists = subprocess.run(['nft', 'list', 'table', 'inet', 'vpnbot_exits'], capture_output=True).returncode == 0
+        script = '' if exists else '''add table inet vpnbot_exits
+add map inet vpnbot_exits clients { type ipv4_addr : mark; }
+add chain inet vpnbot_exits classify { type filter hook prerouting priority -149; policy accept; }
+add rule inet vpnbot_exits classify iifname "tun1" meta mark 0x210 meta mark set ip saddr map @clients
+'''
+        script += 'flush map inet vpnbot_exits clients\n'
+        if entries:
+            pairs = ', '.join(f'{ipaddress.ip_address(ip)} : {mark}' for ip, mark in entries.items())
+            script += 'add element inet vpnbot_exits clients { ' + pairs + ' }\n'
+        command(['nft', '-f', '-'], input=script)
+        atomic(fingerprint, digest)
+
+def apply(state):
+    for n in state['nodes']:
+        if n['status'] != 'ready':
+            continue
+        command(['systemctl', 'start', 'wg-quick@' + n['interface']])
+        for incoming, outgoing in [('tun1', n['interface']), (n['interface'], 'tun1')]:
+            rule = ['-t', 'mangle', '-i', incoming, '-o', outgoing, '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--set-mss', '1360']
+            if subprocess.run(['iptables', '-w', '-C', 'FORWARD'] + rule, capture_output=True).returncode:
+                command(['iptables', '-w', '-I', 'FORWARD'] + rule)
+        table = str(n['table'])
+        command(['ip', '-4', 'route', 'replace', 'blackhole', 'default', 'metric', '32767', 'table', table])
+        if subprocess.run(['ip', 'link', 'show', n['interface']], capture_output=True).returncode == 0:
+            command(['ip', '-4', 'route', 'replace', 'table', table, 'default', 'dev', n['interface'], 'metric', '10'])
+        pref = str(12000 + int(n['id'][1:]))
+        rules = command(['ip', '-4', 'rule', 'show'])
+        if not re.search(r'^' + pref + r':', rules, re.M):
+            command(['ip', '-4', 'rule', 'add', 'pref', pref, 'fwmark', table, 'lookup', table])
+    selected = node(state, state['default'])
+    atomic('/etc/default/vpnbot-routing', f"VPN_EGRESS_INTERFACE={selected['interface']}\nVPN_EGRESS_PEER={selected['peer']}\nVPN_EGRESS_MSS=1360\n", 0o644)
+    command(['/usr/local/sbin/vpnbot-route-health'])
+    map_routes(state)
+
+def check(n, proxy=False):
+    if n['status'] != 'ready':
+        raise ControlError('Сервер ещё не готов. Обновите статус установки.')
+    command(['ping', '-n', '-c', '2', '-W', '2', '-I', n['interface'], n['peer']], timeout=8)
+    # A ping is insufficient: verify internet/NAT using a marked socket in the VPN subnet.
+    import ssl
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(12)
+    raw.setsockopt(socket.SOL_SOCKET, 36, n['table'])
+    raw.bind(('10.9.0.1', 0))
+    try:
+        raw.connect(('1.1.1.1', 443))
+        with ssl.create_default_context().wrap_socket(raw, server_hostname='one.one.one.one') as tls:
+            tls.sendall(b'GET /cdn-cgi/trace HTTP/1.1\r\nHost: one.one.one.one\r\nConnection: close\r\n\r\n')
+            data = b''
+            while True:
+                chunk = tls.recv(4096)
+                if not chunk: break
+                data += chunk
+            if b' 200 ' not in data.split(b'\r\n')[0] or ('ip=' + n['host']).encode() not in data:
+                raise ControlError('Проверка внешнего адреса/NAT нового выхода не пройдена.')
+    finally:
+        raw.close()
+    if proxy:
+        if not n['telegram']:
+            raise ControlError('На выбранном сервере не настроен доступ Telegram.')
+        result = command(['curl', '-sS', '--max-time', '15', '--socks5-hostname', n['peer'] + ':1080',
+                          '-o', '/dev/null', '-w', '%{http_code}', 'https://api.telegram.org/'], timeout=20)
+        if result not in ('200', '302'):
+            raise ControlError('Telegram API через новый прокси недоступен.')
+
+def set_proxy(state):
+    if not state.get('proxy'):
+        return
+    n = node(state, state['proxy'])
+    path = Path('/etc/systemd/system/vpnbot-bot-proxy.service.d/egress.conf')
+    value = '[Service]\nExecStart=\nExecStart=/usr/lib/systemd/systemd-socket-proxyd ' + n['peer'] + ':1080\n'
+    if path.exists() and path.read_text() == value:
+        return
+    atomic(path, value, 0o644)
+    command(['systemctl', 'daemon-reload'])
+    command(['systemctl', 'restart', 'vpnbot-bot-proxy.service'])
+
+def mutate(request):
+    candidate = node(load(), request.get('target'))
+    check(candidate, proxy=request['action'] == 'proxy' or bool(request.get('telegram')))
+    with lock('state'):
+        state = load()
+        if request.get('revision') != state['revision']:
+            raise ControlError('Список изменился. Откройте меню заново и подтвердите актуальный выбор.')
+        before = copy.deepcopy(state)
+        target = node(state, request.get('target'))
+        moved = 0
+        if request['action'] == 'assign':
+            state['assignments'][client_name(request.get('client'))] = target['id']
+            moved = 1
+        elif request['action'] == 'move':
+            source = node(state, request.get('source'))
+            if source['id'] == target['id']:
+                raise ControlError('Выберите другой сервер.')
+            clients = request.get('clients')
+            if not isinstance(clients, list) or len(clients) > 5000:
+                raise ControlError('Некорректный список клиентов.')
+            for cn in set(client_name(c) for c in clients):
+                if state['assignments'].get(cn, state['default']) == source['id']:
+                    state['assignments'][cn] = target['id']
+                    moved += 1
+            # Include offline/expired certificates and future renewals that still have this assignment.
+            for cn, current in list(state['assignments'].items()):
+                if current == source['id']: state['assignments'][cn] = target['id']
+            if state['default'] == source['id']: state['default'] = target['id']
+        if request['action'] == 'proxy' or request.get('telegram'):
+            state['proxy'] = target['id']
+        state['revision'] += 1
+        try:
+            apply(state)
+            set_proxy(state)
+            save(state)
+        except Exception:
+            apply(before)
+            set_proxy(before)
+            raise ControlError('Переключение не завершено; восстановлена предыдущая конфигурация.')
+        return {'moved': moved}
+
+def validate_new(request, state):
+    try:
+        address = ipaddress.ip_address(request['host'])
+        if address.version != 4 or not address.is_global: raise ValueError()
+        if request['host'] == state['entryHost']: raise ValueError()
+        if not isinstance(request['port'], int) or not 1 <= request['port'] <= 65535: raise ValueError()
+        if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', request['username']): raise ValueError()
+        if not isinstance(request['password'], str) or not 1 <= len(request['password']) <= 512: raise ValueError()
+        if any(c in request['password'] for c in '\n\r\x00'): raise ValueError()
+        if not isinstance(request['name'], str) or not 1 <= len(request['name']) <= 40: raise ValueError()
+        if any(ord(c) < 32 for c in request['name']): raise ValueError()
+        if not isinstance(request['telegram'], bool): raise ValueError()
+    except (ValueError, KeyError, TypeError):
+        raise ControlError('Некорректные данные VPS. Нужен публичный IPv4, SSH-порт, логин и пароль.')
+
+def stage(key, message):
+    with lock('state'):
+        s = load(); node(s, key)['stage'] = message; save(s)
+
+def remote(client, script, username, password, timeout=600):
+    # The password is sent via stdin only, never in a command, process argv or file.
+    cmd = 'bash -se' if username == 'root' else 'sudo -S -p "" bash -c ' + shlex.quote(script)
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    stdout.channel.set_combine_stderr(True)
+    stdin.write(script if username == 'root' else password + '\n')
+    stdin.channel.shutdown_write()
+    out = stdout.read().decode()
+    if stdout.channel.recv_exit_status() != 0:
+        raise ControlError('Установка на VPS не завершилась. Проверьте Ubuntu/Debian, sudo и доступ к репозиториям пакетов.')
+    return out
+
+def provision(key, request):
+    import paramiko
+    s = load(); n = node(s, key)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        stage(key, 'Подключение к SSH напрямую из Москвы')
+        client.connect(n['host'], port=request['port'], username=request['username'], password=request['password'],
+                       timeout=15, auth_timeout=20, banner_timeout=20, look_for_keys=False, allow_agent=False)
+        fingerprint = hashlib.sha256(client.get_transport().get_remote_server_key().asbytes()).hexdigest()
+        if n.get('sshFingerprint') and n['sshFingerprint'] != fingerprint:
+            raise ControlError('SSH-ключ сервера изменился. Проверьте VPS перед повторной установкой.')
+        with lock('state'):
+            current = load(); node(current, key)['sshFingerprint'] = fingerprint; save(current)
+        stage(key, 'Установка WireGuard и настройка выхода')
+        folder = ROOT / key; folder.mkdir(mode=0o700, exist_ok=True)
+        private = folder / 'wireguard.key'
+        if not private.exists(): atomic(private, command(['wg', 'genkey']) + '\n')
+        public = command(['wg', 'pubkey'], input=private.read_text())
+        # The installer touches only its own interface and does not replace an existing VPN.
+        proxy = '''apt-get install -y -qq --no-install-recommends dante-server
+cat > /etc/danted.conf <<'DANTE'
+logoutput: syslog
+internal: PEER port = 1080
+external: EXTERNAL
+socksmethod: none
+clientmethod: none
+user.privileged: root
+user.unprivileged: nobody
+client pass { from: LOCAL/32 to: 0.0.0.0/0 }
+socks pass { from: LOCAL/32 to: 0.0.0.0/0 command: connect protocol: tcp }
+DANTE
+sed -i "s/EXTERNAL/$external/" /etc/danted.conf
+mkdir -p /etc/systemd/system/danted.service.d
+printf '[Unit]\\nRequires=wg-quick@vpnbot-exit.service\\nAfter=wg-quick@vpnbot-exit.service\\nPartOf=wg-quick@vpnbot-exit.service\\n' > /etc/systemd/system/danted.service.d/vpnbot.conf
+danted -V -f /etc/danted.conf
+systemctl daemon-reload
+systemctl enable --now danted
+'''.replace('PEER', n['peer']).replace('LOCAL', n['local']) if n['telegram'] else ''
+        script = f'''set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+test -r /etc/os-release
+. /etc/os-release
+case "$ID" in ubuntu|debian) ;; *) exit 1;; esac
+test -c /dev/net/tun
+if [ ! -e /etc/vpnbot-exit-owner ]; then
+  test ! -e /etc/wireguard/vpnbot-exit.conf
+  test -z "$(ip -o link show type wireguard)"
+  if command -v danted >/dev/null; then exit 1; fi
+else
+  test "$(cat /etc/vpnbot-exit-owner)" = {shlex.quote(s['entryHost'] + ':' + key)}
+fi
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends wireguard-tools iptables curl
+umask 077
+mkdir -p /etc/wireguard
+test -f /etc/wireguard/vpnbot-exit.key || wg genkey > /etc/wireguard/vpnbot-exit.key
+external=$(ip -4 route show default | awk 'NR==1 {{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}}')
+test -n "$external"
+printf '%s\\n' {shlex.quote(s['entryHost'] + ':' + key)} > /etc/vpnbot-exit-owner
+cat > /etc/wireguard/vpnbot-exit.conf <<WG
+[Interface]
+Address = {n['peer']}/30
+ListenPort = 51822
+MTU = 1400
+PrivateKey = $(cat /etc/wireguard/vpnbot-exit.key)
+PostUp = sysctl -q -w net.ipv4.conf.%i.rp_filter=2
+PostUp = iptables -w -C INPUT -s {s['entryHost']}/32 -p udp --dport 51822 -j ACCEPT || iptables -w -I INPUT -s {s['entryHost']}/32 -p udp --dport 51822 -j ACCEPT
+PostUp = iptables -w -C INPUT -i %i -s {n['local']}/32 -j ACCEPT || iptables -w -I INPUT -i %i -s {n['local']}/32 -j ACCEPT
+PostUp = iptables -w -t nat -C POSTROUTING -s 10.9.0.0/24 -o $external -m comment --comment vpnbot-managed-exit -j MASQUERADE || iptables -w -t nat -I POSTROUTING -s 10.9.0.0/24 -o $external -m comment --comment vpnbot-managed-exit -j MASQUERADE
+PostUp = iptables -w -I FORWARD -i %i -s 10.9.0.0/24 -j ACCEPT
+PostUp = iptables -w -I FORWARD -o %i -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -w -D FORWARD -i %i -s 10.9.0.0/24 -j ACCEPT
+PostDown = iptables -w -D FORWARD -o %i -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+[Peer]
+PublicKey = {public}
+AllowedIPs = {n['local']}/32, 10.9.0.0/24
+Endpoint = {s['entryHost']}:{n['port']}
+PersistentKeepalive = 15
+WG
+chmod 600 /etc/wireguard/vpnbot-exit.conf
+printf 'net.ipv4.ip_forward=1\\n' > /etc/sysctl.d/90-vpnbot-exit.conf
+sysctl -q -p /etc/sysctl.d/90-vpnbot-exit.conf
+systemctl enable wg-quick@vpnbot-exit
+systemctl restart wg-quick@vpnbot-exit
+{proxy}
+printf '\\nVPNBOT_PUBLIC='
+wg pubkey < /etc/wireguard/vpnbot-exit.key
+'''
+        out = remote(client, script, request['username'], request['password'])
+        match = re.search(r'^VPNBOT_PUBLIC=([A-Za-z0-9+/]{43}=)$', out, re.M)
+        if not match: raise ControlError('VPS не вернул публичный ключ канала.')
+        stage(key, 'Проверка канала и внешнего адреса')
+        config = f"[Interface]\nAddress = {n['local']}/30\nListenPort = {n['port']}\nMTU = 1400\nTable = off\nPostUp = sysctl -q -w net.ipv4.conf.%i.rp_filter=2\nPrivateKey = {private.read_text().strip()}\n[Peer]\nPublicKey = {match[1]}\nAllowedIPs = 0.0.0.0/0\nEndpoint = {n['host']}:51822\nPersistentKeepalive = 15\n"
+        atomic('/etc/wireguard/' + n['interface'] + '.conf', config)
+        command(['systemctl', 'enable', '--now', 'wg-quick@' + n['interface']])
+        command(['wg', 'syncconf', n['interface'], '/dev/stdin'], input=command(['wg-quick', 'strip', n['interface']]) + '\n')
+        for incoming, outgoing in [('tun1', n['interface']), (n['interface'], 'tun1')]:
+            rule = ['-t', 'mangle', '-i', incoming, '-o', outgoing, '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--set-mss', '1360']
+            if subprocess.run(['iptables', '-w', '-C', 'FORWARD'] + rule, capture_output=True).returncode:
+                command(['iptables', '-w', '-I', 'FORWARD'] + rule)
+        with lock('state'):
+            current = load(); node(current, key)['status'] = 'ready'; apply(current)
+        # Do not publish ready until the data plane and optional Telegram path pass.
+        probe = dict(n, status='ready')
+        success = False
+        for _ in range(6):
+            try: check(probe, n['telegram']); success = True; break
+            except Exception: time.sleep(2)
+        if not success: raise ControlError('Канал или внешний выход не прошёл проверку. Проверьте UDP между VPS и Москвой; старые маршруты сохранены.')
+        with lock('state'):
+            current = load(); updated = node(current, key)
+            updated.update(status='ready', stage='Проверки пройдены', error=None)
+            current['revision'] += 1; save(current)
+    except Exception as error:
+        message = str(error) if isinstance(error, ControlError) else 'Не удалось подключиться или настроить VPS. Проверьте SSH-доступ, sudo и сеть.'
+        with lock('state'):
+            current = load(); node(current, key).update(status='error', error=message, stage='Установка прервана')
+            current['revision'] += 1; save(current)
+    finally:
+        request['password'] = ''
+        client.close()
+
+def add(request):
+    with lock('state'):
+        s = load(); validate_new(request, s)
+        existing = next((n for n in s['nodes'] if n['host'] == request['host']), None)
+        if existing and existing['status'] != 'error':
+            raise ControlError('Такой VPS уже зарегистрирован. Обновите его статус.')
+        if existing:
+            n = existing
+            n.update(status='provisioning', error=None, telegram=request['telegram'])
+        else:
+            number = max(int(n['id'][1:]) for n in s['nodes']) + 1
+            if number > 200: raise ControlError('Достигнут лимит выходов.')
+            n = dict(id=f'e{number}', name=request['name'], host=request['host'], interface=f'wge{number}',
+                     peer=f'10.214.{number}.2', local=f'10.214.{number}.1', port=53000+number,
+                     table=23000+number, telegram=request['telegram'], status='provisioning', stage='Установка запущена')
+            s['nodes'].append(n)
+        s['revision'] += 1; save(s)
+        key = n['id']
+        n['bootId'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        save(s)
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        null = os.open('/dev/null', os.O_RDWR)
+        for fd in (0, 1, 2): os.dup2(null, fd)
+        provision(key, request)
+        os._exit(0)
+    with lock('state'):
+        s = load(); node(s, key)['pid'] = pid; save(s)
+    return {'id': key}
+
+def status():
+    with lock('state'):
+        s = load()
+        for n in s['nodes']:
+            if n['status'] == 'provisioning' and n.get('pid'):
+                try:
+                    if n.get('bootId') != Path('/proc/sys/kernel/random/boot_id').read_text().strip(): raise ProcessLookupError()
+                    os.kill(n['pid'], 0)
+                except ProcessLookupError:
+                    n.update(status='error', error='Установка прервана. Добавьте этот адрес повторно для продолжения.')
+                    s['revision'] += 1; save(s)
+        return s
+
+def session(event):
+    cn = client_name(event.get('client'))
+    address = str(ipaddress.ip_address(event.get('ip')))
+    if ipaddress.ip_address(address) not in CLIENT_NET: raise ControlError('Некорректный VPN-адрес.')
+    with lock('sessions'):
+        path = RUN / 'sessions.json'; events = json.loads(path.read_text()) if path.exists() else {}
+        events = {k:v for k,v in events.items() if time.time() - v['time'] < 30}
+        previous = events.get(cn)
+        if event.get('connected') is not True and previous and previous['connected'] and previous['ip'] != address:
+            return
+        events[cn] = {'ip': address, 'connected': event.get('connected') is True, 'time': time.time()}
+        atomic(path, json.dumps(events))
+    with lock('state'): map_routes(load())
+
+def serve():
+    account = pwd.getpwnam(os.environ.get('VPN_OPENVPN_USER', 'nobody'))
+    RUN.mkdir(mode=0o710, parents=True, exist_ok=True)
+    os.chown(RUN, 0, account.pw_gid); os.chmod(RUN, 0o710)
+    path = str(RUN / 'session.sock')
+    if os.path.exists(path): os.unlink(path)
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            _, uid, _ = struct.unpack('3i', self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid not in (0, account.pw_uid): return
+            self.request.settimeout(5)
+            try:
+                value = self.rfile.readline(2049)
+                if len(value) > 2048 or not value.endswith(b'\n'): return
+                session(json.loads(value))
+                self.wfile.write(b'OK\n')
+            except Exception:
+                self.wfile.write(b'ERROR\n')
+    class Server(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+    with Server(path, Handler) as server:
+        os.chown(path, 0, account.pw_gid); os.chmod(path, 0o660)
+        notify = os.environ.get('NOTIFY_SOCKET')
+        if notify:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as ready:
+                ready.connect('\0' + notify[1:] if notify.startswith('@') else notify)
+                ready.sendall(b'READY=1')
+        server.serve_forever()
+
+def main():
+    if os.geteuid() != 0: raise ControlError('Требуются права root.')
+    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        serve(); return
+    if len(sys.argv) > 1 and sys.argv[1] == 'tick':
+        with lock('state'): map_routes(load())
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == 'reconcile':
+        with lock('state'): apply(load())
+        return
+    request = json.loads(sys.stdin.read(262145))
+    if not isinstance(request, dict): raise ControlError('Некорректный запрос.')
+    if len(sys.argv) > 1 and sys.argv[1] == 'session':
+        session(request); return
+    action = request.get('action')
+    if action == 'status': result = status()
+    elif action == 'add': result = add(request)
+    elif action in ('move', 'assign', 'proxy'): result = mutate(request)
+    elif action == 'check':
+        check(node(load(), request.get('id')))
+        result = {'healthy': True, 'message': 'Канал и выход в интернет работают.'}
+    elif action == 'reconcile':
+        with lock('state'): apply(load())
+        result = {}
+    else: raise ControlError('Неизвестная операция.')
+    print(json.dumps({'ok': True, 'data': result}, ensure_ascii=False))
+
+if __name__ == '__main__':
+    try: main()
+    except Exception as e:
+        message = str(e) if isinstance(e, ControlError) else 'Сетевая операция не выполнена. Проверьте статус сервера.'
+        print(json.dumps({'ok': False, 'error': message}, ensure_ascii=False))
+        if len(sys.argv) > 1: sys.exit(1)

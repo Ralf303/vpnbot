@@ -1,0 +1,18 @@
+[Unit]
+Description=Accept local OpenVPN connection events
+Requires=vpnbot-egress-manager.service
+After=vpnbot-egress-manager.service
+Before=openvpn-server@server-tcp.service
+
+[Service]
+Type=notify
+TimeoutStartSec=30
+ExecStart=/usr/local/sbin/vpnbot-egress-control serve
+Environment=VPN_OPENVPN_USER=nobody
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

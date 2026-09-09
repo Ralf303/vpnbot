@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore registered VPN exit routes
+After=network-online.target
+Before=openvpn-server@server-tcp.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-egress-control reconcile
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

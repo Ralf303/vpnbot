@@ -12,6 +12,8 @@ const optionalUrl = optionalString.pipe(z.string().url().optional());
 const schema = z.object({
   BOT_TOKEN: z.string().min(10),
   ADMIN_TELEGRAM_ID: z.string().regex(/^\d+$/),
+  ADMIN_VK_ID: optionalString.pipe(z.string().regex(/^\d+$/).optional()),
+  VPN_ENTRY_SERVER_KEY: optionalString.pipe(z.string().regex(/^[A-Za-z0-9_-]{1,32}$/).optional()),
   CONTACT_URL: z.string().url().default("https://t.me/ralfy"),
   DATABASE_URL: z.string().url().startsWith("postgresql://"),
   TIMEZONE: z.string().default("Europe/Moscow"),
@@ -72,6 +74,8 @@ export interface VpnProfileOptions {
 export interface AppConfig {
   botToken: string;
   adminTelegramId: string;
+  adminVkId?: string | undefined;
+  entryServerKey?: string | undefined;
   contactUrl: string;
   databaseUrl: string;
   timezone: string;
@@ -206,6 +210,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     botToken: parsed.BOT_TOKEN,
     adminTelegramId: parsed.ADMIN_TELEGRAM_ID,
+    adminVkId: parsed.ADMIN_VK_ID,
+    entryServerKey: parsed.VPN_ENTRY_SERVER_KEY,
     contactUrl: parsed.CONTACT_URL,
     databaseUrl: parsed.DATABASE_URL,
     timezone: parsed.TIMEZONE,
