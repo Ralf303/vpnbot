@@ -838,7 +838,7 @@ export function createBot(
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     pendingInputs.delete(String(ctx.from.id));
     await ctx.answerCallbackQuery();
-    if (emergency && ctx.chat?.type === "private") return emergency.action(`tg:${ctx.from.id}`, { a: "eg_list" }, emergencyReply(ctx));
+    emergency?.cancel(`tg:${ctx.from.id}`);
     await showServersList(ctx, serverManager);
   });
 
@@ -939,7 +939,7 @@ export function createBot(
 
   bot.callbackQuery("svadd", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    if (emergency && ctx.chat?.type === "private") { await ctx.answerCallbackQuery(); return emergency.action(`tg:${ctx.from.id}`, { a: "eg_add" }, emergencyReply(ctx)); }
+    emergency?.cancel(`tg:${ctx.from.id}`);
     pendingInputs.set(String(ctx.from.id), { kind: "server-add" });
     await ctx.answerCallbackQuery();
     await edit(
