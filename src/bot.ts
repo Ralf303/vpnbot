@@ -307,18 +307,15 @@ export function createBot(
 
     if (pending.kind === "server-add") {
       if (!isAdmin(ctx, appConfig)) return;
-      const parts = ctx.message.text
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const [host = "", portText = "22", password = "", name = ""] = parts;
-      const port = Number(portText);
       try {
+        const parts = ctx.message.text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n");
+        if (parts.length !== 4) throw new Error("Нужны ровно четыре строки: IP, порт, пароль root, название. Логин root отдельно указывать не нужно.");
+        const [host = "", portText = "", password = "", name = ""] = parts;
         const server = await serverManager.addServer({
-          host,
-          port,
+          host: host.trim(),
+          port: Number(portText.trim()),
           rootPassword: password,
-          name,
+          name: name.trim(),
         });
         await ctx.reply(
           `⏳ Началась настройка сервера «${server.name}» (${server.host}). Это займёт несколько минут — по окончании пришлю уведомление.`,

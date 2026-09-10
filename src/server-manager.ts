@@ -55,7 +55,8 @@ export class ServerManager {
     if (
       !server ||
       !server.record.enabled ||
-      server.record.status !== "ready"
+      server.record.status !== "ready" ||
+      !server.target.privateKey || server.target.hostFingerprint === "pending"
     ) {
       return null;
     }
@@ -68,6 +69,7 @@ export class ServerManager {
         (server) =>
           server.record.enabled &&
           server.record.status === "ready" &&
+          Boolean(server.target.privateKey) &&
           server.target.hostFingerprint !== "pending"
       )
       .map((server) => server.target);
@@ -104,7 +106,7 @@ export class ServerManager {
     const record = await this.db.getServerByKey(serverKey);
     if (record?.relayManaged) {
       const target = this.targetFor(record);
-      if (target) await this.gateway.stopManagedRelay(target);
+      if (target?.privateKey && target.hostFingerprint !== "pending") await this.gateway.stopManagedRelay(target);
     }
     return this.db.deleteServer(serverKey);
   }
@@ -130,15 +132,19 @@ export class ServerManager {
       );
     if (!this.config.relayProvisioning)
       throw new Error("Не настроен автоматический relay для новых серверов");
-    if (await this.db.getServerByHost(host))
+    const existing = await this.db.getServerByHost(host);
+    if (existing && (existing.status !== "error" || existing.sshPrivateKey || existing.hostFingerprint !== "pending"))
       throw new Error("Сервер с таким адресом уже добавлен");
 
-    const sshKey = await this.nextServerKey();
-    const relayPort = await this.db.nextRelayPort(
+    const sshKey = existing?.key ?? await this.nextServerKey();
+    const relayPort = existing?.relayPort ?? await this.db.nextRelayPort(
       this.config.relayProvisioning.portStart,
       this.config.relayProvisioning.portEnd
     );
-    const server = await this.db.createServerPlaceholder({
+    const server = existing ? await this.db.updateServer(existing.key, {
+      name: input.name, port: input.port, relayPort,
+      status: "pending", enabled: false, lastError: null,
+    }) : await this.db.createServerPlaceholder({
       key: sshKey,
       name: input.name,
       host,
@@ -238,8 +244,6 @@ export class ServerManager {
   }
 
   private targetFor(record: VpnServerRecord): VpnServerTarget | null {
-    if (!record.sshPrivateKey || record.hostFingerprint === "pending")
-      return null;
     return {
       key: record.key,
       name: record.name,

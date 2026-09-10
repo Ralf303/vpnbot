@@ -176,6 +176,23 @@ describe("ServerManager", () => {
     await expect(manager.serverName("old")).resolves.toBe("Переименованный");
   });
 
+  it("показывает неудачную установку и повторяет её без дубликата и смены relay-порта", async () => {
+    const first = await manager.addServer({host:"4.3.2.1",port:22,rootPassword:"wrong",name:"First"});
+    await db.updateServer(first.key, {status:"error",lastError:"Authentication failed"});
+    expect((await manager.listServers()).map(s=>s.record.key)).toContain(first.key);
+    expect((await manager.getServer(first.key))?.record.status).toBe("error");
+    await expect(manager.resolveTarget(first.key)).resolves.toBeNull();
+    const retry = await manager.addServer({host:"4.3.2.1",port:2222,rootPassword:"correct",name:"Retry"});
+    expect(retry).toMatchObject({key:first.key,relayPort:first.relayPort,port:2222,name:"Retry",status:"pending",lastError:null});
+    expect(await db.listServers()).toHaveLength(1);
+  });
+
+  it("не переустанавливает сервер с уже сохранённым управляющим ключом", async () => {
+    const first = await manager.addServer({host:"4.3.2.1",port:22,rootPassword:"secret",name:"First"});
+    await db.updateServer(first.key, {status:"error",sshPrivateKey:"existing-key",hostFingerprint:"SHA256:existing"});
+    await expect(manager.addServer({host:"4.3.2.1",port:22,rootPassword:"secret",name:"Retry"})).rejects.toThrow("уже добавлен");
+  });
+
   it("отключает SSH-прокси только для перечисленного сервера", async () => {
     const directManager = new ServerManager(db, {} as OpenVpnGateway, {
       ...appConfig,

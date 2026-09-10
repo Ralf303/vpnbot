@@ -278,8 +278,15 @@ def provision(key, request):
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         stage(key, 'Подключение к SSH напрямую из Москвы')
-        client.connect(n['host'], port=request['port'], username=request['username'], password=request['password'],
-                       timeout=15, auth_timeout=20, banner_timeout=20, look_for_keys=False, allow_agent=False)
+        try:
+            client.connect(n['host'], port=request['port'], username=request['username'], password=request['password'],
+                           timeout=15, auth_timeout=20, banner_timeout=20, look_for_keys=False, allow_agent=False)
+        except paramiko.AuthenticationException:
+            raise ControlError('SSH отклонил логин или пароль. Проверьте данные после переустановки ОС и повторите добавление.')
+        except (TimeoutError, socket.timeout):
+            raise ControlError('SSH не ответил вовремя. Проверьте адрес, порт и доступность VPS из Москвы.')
+        except paramiko.ssh_exception.NoValidConnectionsError:
+            raise ControlError('Не удалось открыть SSH-соединение. Проверьте порт и правила доступа VPS.')
         fingerprint = hashlib.sha256(client.get_transport().get_remote_server_key().asbytes()).hexdigest()
         if n.get('sshFingerprint') and n['sshFingerprint'] != fingerprint:
             raise ControlError('SSH-ключ сервера изменился. Проверьте VPS перед повторной установкой.')
@@ -402,7 +409,7 @@ def add(request):
             raise ControlError('Такой VPS уже зарегистрирован. Обновите его статус.')
         if existing:
             n = existing
-            n.update(status='provisioning', error=None, telegram=request['telegram'])
+            n.update(status='provisioning', error=None, name=request['name'], telegram=request['telegram'])
         else:
             number = max(int(n['id'][1:]) for n in s['nodes']) + 1
             if number > 200: raise ControlError('Достигнут лимит выходов.')

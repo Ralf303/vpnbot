@@ -45,7 +45,7 @@ export class EgressAdmin {
       if (action.a === "eg_credentials") {
         if (!["tg", "vpn"].includes(action.id ?? "")) throw new Error("Выберите режим установки.");
         this.pending.set(actor, { telegram: action.id === "tg", expires: Date.now() + 10 * 60_000 });
-        await reply("Отправьте одним сообщением пять строк:\nНазвание сервера\nПубличный IPv4\nSSH-порт (обычно 22)\nSSH-логин\nПароль\n\nНужен чистый Ubuntu/Debian и root либо пользователь с sudo. Установка начнётся после отправки. Пароль не сохраняется в настройках или журналах бота. Для отмены: /cancel.", [[button("Отмена", "eg_list")]]); return;
+        await reply("Отправьте одним сообщением четыре строки:\nПубличный IPv4\nSSH-порт (обычно 22)\nПароль root\nНазвание сервера\n\nНужен чистый Ubuntu/Debian. Для другого SSH-пользователя с sudo поддерживается прежний формат из пяти строк: название, IPv4, порт, логин, пароль. Установка начнётся после отправки. Пароль не сохраняется в настройках или журналах бота. Для отмены: /cancel.", [[button("Отмена", "eg_list")]]); return;
       }
       if (action.a === "eg_check" && action.id) {
         const result = await this.service.check(action.id);

@@ -124,4 +124,19 @@ class ControlTest(unittest.TestCase):
         self.assertNotIn('special-secret', client.exec_command.call_args.args[0])
         stdin.write.assert_called_once_with('special-secret\n')
 
+    def test_ssh_errors_explain_authentication_and_timeout_without_secrets(self):
+        class AuthenticationError(Exception): pass
+        for error, expected in [(AuthenticationError('secret'), 'логин или пароль'), (TimeoutError('secret'), 'не ответил вовремя')]:
+            with self.subTest(error=type(error).__name__):
+                fake = MagicMock()
+                fake.AuthenticationException = AuthenticationError
+                fake.ssh_exception.NoValidConnectionsError = ConnectionError
+                fake.SSHClient.return_value.connect.side_effect = error
+                request = dict(port=22, username='root', password='secret')
+                with patch.dict(sys.modules, {'paramiko':fake}): c.provision('e2', request)
+                state = c.load()
+                self.assertIn(expected, c.node(state,'e2')['error'])
+                self.assertNotIn('secret', c.STATE.read_text())
+                self.assertEqual(request['password'], '')
+
 if __name__ == '__main__': unittest.main()

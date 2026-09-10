@@ -16,8 +16,9 @@ export interface EgressSnapshot {
 export interface EgressCredentials { name: string; host: string; port: number; username: string; password: string; }
 export function parseEgressCredentials(text: string): EgressCredentials {
   const lines = text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n");
-  if (lines.length !== 5) throw new Error("Отправьте пять строк: название, IPv4, SSH-порт, логин, пароль.");
-  const [name = "", host = "", portText = "", username = "", password = ""] = lines;
+  if (![4, 5].includes(lines.length)) throw new Error("Отправьте четыре строки: IPv4, SSH-порт, пароль root, название сервера.");
+  const fields = lines.length === 4 ? [lines[3], lines[0], lines[1], "root", lines[2]] : lines;
+  const [name = "", host = "", portText = "", username = "", password = ""] = fields;
   if (!name.trim() || name.trim().length > 40 || /[\x00-\x1f]/.test(name)) throw new Error("Название: от 1 до 40 символов.");
   const octets = host.trim().split(".");
   if (octets.length !== 4 || octets.some(x => !/^\d{1,3}$/.test(x) || Number(x) > 255)) throw new Error("Укажите IPv4 нового VPS.");

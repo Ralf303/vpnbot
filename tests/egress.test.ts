@@ -26,6 +26,8 @@ describe("emergency egress", () => {
   });
   it("validates credential structure and preserves special characters in password", () => {
     expect(parseEgressCredentials('Резерв\n8.8.8.8\n22\nroot\n a$! + ').password).toBe(' a$! + ');
+    expect(parseEgressCredentials('8.8.8.8\r\n22\r\n a$! + \r\nРезерв')).toEqual({host:'8.8.8.8',port:22,password:' a$! + ',username:'root',name:'Резерв'});
+    expect(()=>parseEgressCredentials('8.8.8.8\n22\nroot\npassword\nРезерв')).toThrow();
     expect(()=>parseEgressCredentials('Резерв\n8.8.8.8;id\n22\nroot\npass')).toThrow();
   });
   it("requires confirmation before bulk switch, with revision protection", async () => {
