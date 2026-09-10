@@ -188,7 +188,7 @@ export class ServerManager {
     const record = await this.db.getServerByKey(serverKey);
     if (!record) return;
     const fail = async (error: unknown): Promise<void> => {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = formatBootstrapError(error);
       await this.db
         .updateServer(serverKey, {
           status: "error",
@@ -301,7 +301,7 @@ export class ServerManager {
   }
 }
 
-function renderBootstrapScript(
+export function renderBootstrapScript(
   publicKey: string,
   relay: NonNullable<AppConfig["relayProvisioning"]>,
   relayPort: number
@@ -330,25 +330,31 @@ function renderBootstrapScript(
   return `set -Eeuo pipefail
 
 SRV_KEY="SRV_KEY_PLACEHOLDER"
+VPNBOT_STAGE=packages
+trap 'rc=\\$?; printf "VPNBOT_SETUP_ERROR stage=%s line=%s code=%s\\n" "\\$VPNBOT_STAGE" "\\$LINENO" "\\$rc" >&2; exit "\\$rc"' ERR
 
 export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
-export NEEDRESTART_MODE=a
+export NEEDRESTART_MODE=l
 
 apt-get update -qq
 apt-get install -y -qq openssh-server openssl ca-certificates curl sudo
 
 SSH_DIR="/etc/ssh"
+VPNBOT_STAGE=keys
 mkdir -p "\\$SSH_DIR"
 if ! ls "\\$SSH_DIR"/ssh_host_*_key >/dev/null 2>&1; then
   ssh-keygen -A
 fi
 
 BOT_KEY_PATH="\\$SSH_DIR/vpnbot_ed25519"
-rm -f "\\$BOT_KEY_PATH" "\\$BOT_KEY_PATH.pub"
-ssh-keygen -q -t ed25519 -N "" -C "vpnbot-SRV_KEY_PLACEHOLDER" -f "\\$BOT_KEY_PATH"
+if [[ ! -f "\\$BOT_KEY_PATH" ]]; then
+  ssh-keygen -q -t ed25519 -N "" -C "vpnbot-SRV_KEY_PLACEHOLDER" -f "\\$BOT_KEY_PATH"
+fi
+ssh-keygen -y -f "\\$BOT_KEY_PATH" > "\\$BOT_KEY_PATH.pub"
 BOT_PUB_LINE="\\$(cat "\\$BOT_KEY_PATH.pub")"
 
+VPNBOT_STAGE=openvpn_install
 if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
   if [[ ! -x /etc/openvpn/server/easy-rsa/easyrsa ]]; then
     cd /root
@@ -360,6 +366,7 @@ if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
   chmod 0755 /usr/local/sbin/openvpn-bot-helper
 fi
 
+VPNBOT_STAGE=openvpn_config
 grep -Eq '^proto (tcp|tcp-server)$' /etc/openvpn/server/server.conf || {
   echo 'Существующий OpenVPN настроен не на TCP' >&2
   exit 1
@@ -376,6 +383,9 @@ install -d -o nobody -g nogroup -m 0700 /var/lib/openvpn-bot/traffic-events
 
 SERVER_CONF="/etc/openvpn/server/server.conf"
 touch "\\$SERVER_CONF"
+# The installer may bind to the public IPv4; the reverse tunnel connects locally.
+sed -i -E '/^[[:space:]]*local[[:space:]]+/d' "\\$SERVER_CONF"
+echo 'local 127.0.0.1' >> "\\$SERVER_CONF"
 grep -q '^script-security' "\\$SERVER_CONF" || echo 'script-security 2' >> "\\$SERVER_CONF"
 grep -q '^status ' "\\$SERVER_CONF" || echo 'status /run/openvpn-server/server-status.tsv 10' >> "\\$SERVER_CONF"
 grep -q '^status-version' "\\$SERVER_CONF" || echo 'status-version 3' >> "\\$SERVER_CONF"
@@ -383,6 +393,7 @@ grep -q '^client-disconnect' "\\$SERVER_CONF" || echo 'client-disconnect /usr/lo
 systemctl enable openvpn-server@server.service >/dev/null 2>&1 || true
 systemctl restart openvpn-server@server.service
 
+VPNBOT_STAGE=bot_account
 id -u vpn-bot >/dev/null 2>&1 || useradd -m -s /bin/sh vpn-bot
 install -d -m 0700 -o vpn-bot -g vpn-bot /home/vpn-bot/.ssh
 echo "\\$BOT_PUB_LINE" > /home/vpn-bot/.ssh/authorized_keys
@@ -394,6 +405,7 @@ printf 'vpn-bot ALL=(root) NOPASSWD: /usr/local/sbin/openvpn-bot-helper\\nvpn-bo
 chmod 0440 /etc/sudoers.d/vpn-bot
 visudo -cf /etc/sudoers.d/vpn-bot >/dev/null
 
+VPNBOT_STAGE=relay_config
 install -d -m 0700 /etc/vpnbot-relay
 echo '${relayKeyBase64}' | base64 -d > /etc/vpnbot-relay/id_ed25519
 echo '${knownHostsBase64}' | base64 -d > /etc/vpnbot-relay/known_hosts
@@ -418,41 +430,62 @@ RELAY_UNIT
 
 systemctl daemon-reload
 systemctl enable --now vpnbot-relay-tunnel.service
-sleep 3
-systemctl is-active --quiet vpnbot-relay-tunnel.service
+systemctl restart vpnbot-relay-tunnel.service
+VPNBOT_STAGE=openvpn_check
 timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1194'
-timeout 10 bash -c 'exec 3<>/dev/tcp/${relay.publicHost}/${relayPort}'
+VPNBOT_STAGE=relay_check
+relay_ready=0
+for attempt in {1..6}; do
+  if timeout 5 bash -c 'exec 3<>/dev/tcp/${relay.publicHost}/${relayPort}'; then relay_ready=1; break; fi
+  sleep 2
+done
+if [[ "\\$relay_ready" != 1 ]]; then
+  journalctl -u vpnbot-relay-tunnel.service -n 25 --no-pager >&2 || true
+  false
+fi
 
+VPNBOT_STAGE=result
 FP="\\$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 | awk '{print \\$2}')"
 echo "===VPNBOT-RESULT==="
 echo "fingerprint=\\$FP"
 echo "relay_port=${relayPort}"
-echo "-----BEGIN OPENSSH PRIVATE KEY-----"
 cat "\\$BOT_KEY_PATH"
-echo "-----END OPENSSH PRIVATE KEY-----"
 `;
 }
 
-function parseBootstrapOutput(output: string): {
+export function parseBootstrapOutput(output: string): {
   fingerprint: string;
   privateKey: string;
 } {
   const marker = output.indexOf("===VPNBOT-RESULT===");
   if (marker === -1) {
-    const tail = output.trim().split("\n").slice(-3).join(" | ").slice(0, 300);
-    throw new Error(
-      `Скрипт настройки не вернул результат (${tail || "пустой вывод"})`
-    );
+    throw new Error("Скрипт настройки не вернул итоговый результат.");
   }
   const result = output.slice(marker);
   const fingerprint = result.match(/fingerprint=(SHA256:\S+)/)?.[1];
   const keyMatch = result.match(
     /-----BEGIN OPENSSH PRIVATE KEY-----\s*([\s\S]*?)\s*-----END OPENSSH PRIVATE KEY-----/
   );
-  if (!fingerprint || !keyMatch?.[1])
+  if (!fingerprint || !keyMatch?.[1] || keyMatch[1].includes("-----"))
     throw new Error("Не удалось разобрать ключ и fingerprint нового сервера");
   return {
     fingerprint,
     privateKey: `-----BEGIN OPENSSH PRIVATE KEY-----\n${keyMatch[1].trim()}\n-----END OPENSSH PRIVATE KEY-----\n`,
   };
+}
+
+export function formatBootstrapError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const marker = [...message.matchAll(/VPNBOT_SETUP_ERROR stage=([a-z_]+) line=(\d+) code=(\d+)/g)].at(-1);
+  if (marker) {
+    const stages: Record<string, string> = {
+      packages: "установка пакетов", keys: "создание SSH-ключа", openvpn_install: "установка OpenVPN",
+      openvpn_config: "настройка OpenVPN", bot_account: "доступ бота", relay_config: "настройка обратного туннеля",
+      openvpn_check: "проверка локального OpenVPN", relay_check: "проверка обратного туннеля", result: "получение результата",
+    };
+    const detail = message.includes("Host key verification failed") ? " SSH-ключ relay не совпадает с настройками бота."
+      : message.includes("Permission denied") ? " SSH-доступ relay отклонён." : "";
+    return `Не пройден этап «${stages[marker[1]!] ?? "настройка"}» (код ${marker[3]}, строка ${marker[2]}).${detail}`;
+  }
+  return message.replace(/-----BEGIN [\s\S]*?-----END [^-]+-----/g, "[ключ скрыт]").trim().slice(-500);
 }
