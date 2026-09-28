@@ -97,15 +97,61 @@ print_active_sessions() {
   done
 }
 
+cleanup_managed_server() {
+  local server_key="${2:-}"
+  local relay_dir="/etc/vpnbot-relay"
+  local relay_unit="/etc/systemd/system/vpnbot-relay-tunnel.service"
+  [[ "$server_key" =~ ^srv_[1-9][0-9]*$ ]] || die "Некорректный ключ сервера"
+  # Never accept user-supplied paths or clean a shared/main OpenVPN installation.
+  for path in "$OPENVPN_DIR" "$EASYRSA_DIR" "$relay_dir" "$relay_unit"; do
+    [[ ! -L "$path" ]] || die "Очистка символических ссылок запрещена"
+  done
+  [[ -f "$relay_unit" ]] || die "Не найден управляемый relay; очистка запрещена"
+  grep -Fxq 'Description=VPN bot reverse relay tunnel' "$relay_unit" || die "Чужой relay; очистка запрещена"
+  grep -Fxq 'Requires=openvpn-server@server.service' "$relay_unit" || die "Чужой OpenVPN; очистка запрещена"
+  if [[ -f "$relay_dir/server-key" ]]; then
+    [[ "$(cat "$relay_dir/server-key")" == "$server_key" ]] || die "Ключ сервера не совпадает"
+  else
+    # Older bootstrap releases had no ownership marker. Accept only their exact layout.
+    grep -Fxq 'local 127.0.0.1' "$OPENVPN_DIR/server.conf" || die "Не подтверждена установка ботом"
+    grep -Fxq 'port 1194' "$OPENVPN_DIR/server.conf" || die "Не подтверждена установка ботом"
+    grep -Eq '^proto (tcp|tcp-server)$' "$OPENVPN_DIR/server.conf" || die "Не подтверждена установка ботом"
+  fi
+  shopt -s nullglob
+  local configs=("$OPENVPN_DIR"/*.conf)
+  shopt -u nullglob
+  for path in "${configs[@]}"; do
+    [[ "$path" == "$OPENVPN_DIR/server.conf" ]] || die "На VPS есть другой OpenVPN; очистка запрещена"
+  done
+  systemctl disable --now vpnbot-relay-tunnel.service
+  systemctl disable --now openvpn-server@server.service
+  # Remove only this installation's VPN material; retain the OS, firewall and SSH account.
+  rm -rf -- "$EASYRSA_DIR"
+  rm -f -- "$OPENVPN_DIR/server.conf" "$OPENVPN_DIR/client-common.txt" \
+    "$OPENVPN_DIR/ca.crt" "$OPENVPN_DIR/ca.key" "$OPENVPN_DIR/server.crt" \
+    "$OPENVPN_DIR/server.key" "$OPENVPN_DIR/dh.pem" "$OPENVPN_DIR/crl.pem" \
+    "$OPENVPN_DIR/tc.key" "$OPENVPN_DIR/ta.key"
+  rm -f -- "$relay_unit" /usr/local/sbin/openvpn-traffic-disconnect
+  rm -rf -- "$relay_dir" "$TRAFFIC_EVENTS_DIR"
+  systemctl daemon-reload
+  printf 'VPNBOT_CLEANUP_OK\n'
+}
+
 command="${1:-}"
 case "$command" in
+  cleanup)
+    exec 9>"$LOCK_FILE"
+    flock -w 30 9 || die "Сервер занят другой операцией"
+    cleanup_managed_server "$@"
+    exit 0
+    ;;
   list|stats|traffic-sessions|active-sessions)
     ;;
   create|download|revoke)
     validate_client "${2:-}"
     ;;
   *)
-    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions, active-sessions"
+    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions, active-sessions, cleanup"
     ;;
 esac
 

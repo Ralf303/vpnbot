@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -14,6 +14,60 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("openvpn-bot-helper", () => {
+  async function cleanupFixture() {
+    fixtureRoot = await mkdtemp(join(tmpdir(), "vpnbot-cleanup-"));
+    const root = fixtureRoot;
+    const server = join(root, "etc/openvpn/server");
+    const relay = join(root, "etc/vpnbot-relay");
+    const unit = join(root, "etc/systemd/system/vpnbot-relay-tunnel.service");
+    for (const folder of [server, relay, join(root, "etc/systemd/system"), join(root, "bin")]) await mkdir(folder, { recursive: true });
+    await writeFile(unit, "Description=VPN bot reverse relay tunnel\nRequires=openvpn-server@server.service\n");
+    await writeFile(join(relay, "server-key"), "srv_2\n");
+    await writeFile(join(server, "server.conf"), "local 127.0.0.1\nport 1194\nproto tcp\n");
+    await mkdir(join(server, "easy-rsa/pki"), { recursive: true });
+    await writeFile(join(server, "easy-rsa/pki/private-key"), "secret");
+    const calls = join(root, "systemctl-calls");
+    await writeFile(join(root, "bin/systemctl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\n`, { mode: 0o700 });
+    const source = (await readFile(resolve("deploy/openvpn-bot-helper"), "utf8"))
+      .replaceAll("/etc/", `${root}/etc/`).replaceAll("/usr/local/sbin/", `${root}/usr/local/sbin/`)
+      .replaceAll("/var/lib/openvpn-bot/", `${root}/var/lib/openvpn-bot/`)
+      .replace('LOCK_FILE="/run/lock/openvpn-bot-helper.lock"', `LOCK_FILE="${root}/helper.lock"`);
+    const helper = join(root, "helper");
+    await writeFile(helper, source);
+    const run = (key = "srv_2") => execFileAsync("bash", [helper, "cleanup", key], { env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}` } });
+    return { root, server, relay, calls, run };
+  }
+
+  it("cleans only the owned VPN and stops services before removing keys", async () => {
+    const f = await cleanupFixture();
+    const unrelated = join(f.root, "etc/unrelated-app");
+    await writeFile(unrelated, "keep");
+    expect((await f.run()).stdout.trim()).toBe("VPNBOT_CLEANUP_OK");
+    expect(await readFile(f.calls, "utf8")).toBe("disable --now vpnbot-relay-tunnel.service\ndisable --now openvpn-server@server.service\ndaemon-reload\n");
+    await expect(access(join(f.server, "easy-rsa"))).rejects.toThrow();
+    await expect(access(f.relay)).rejects.toThrow();
+    expect(await readFile(unrelated, "utf8")).toBe("keep");
+  });
+
+  it("refuses wrong ownership and shared PKI before stopping anything", async () => {
+    const f = await cleanupFixture();
+    await expect(f.run("srv_3")).rejects.toThrow("Ключ сервера не совпадает");
+    await writeFile(join(f.server, "other.conf"), "keep");
+    await expect(f.run()).rejects.toThrow("другой OpenVPN");
+    await expect(access(f.calls)).rejects.toThrow();
+    expect(await readFile(join(f.server, "easy-rsa/pki/private-key"), "utf8")).toBe("secret");
+  });
+
+  it("supports the exact old bootstrap layout but refuses an unowned installation", async () => {
+    const f = await cleanupFixture();
+    await rm(join(f.relay, "server-key"));
+    await writeFile(join(f.server, "server.conf"), "port 443\nproto tcp\n");
+    await expect(f.run()).rejects.toThrow("установка ботом");
+    await expect(access(f.calls)).rejects.toThrow();
+    await writeFile(join(f.server, "server.conf"), "local 127.0.0.1\nport 1194\nproto tcp\n");
+    expect((await f.run()).stdout.trim()).toBe("VPNBOT_CLEANUP_OK");
+  });
+
   it("reads active sessions from a named server-status-<instance>.tsv", async () => {
     fixtureRoot = await mkdtemp(join(tmpdir(), "vpnbot-helper-"));
     const openVpnDir = join(fixtureRoot, "openvpn", "server");

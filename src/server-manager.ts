@@ -93,20 +93,30 @@ export class ServerManager {
     return this.gateway.listClients(target);
   }
 
-  async deleteServer(serverKey: string): Promise<{
+  async deleteServer(serverKey: string, cleanRemote = false): Promise<{
     configs: number;
     legacyClients: number;
     pendingRevocations: number;
   }> {
+    if (serverKey === this.config.entryServerKey) {
+      throw new Error("Московскую точку входа нельзя удалить.");
+    }
     if (this.gateway.isConfigured(serverKey)) {
       throw new Error(
         "Этот сервер задан через .env. Сначала удалите его параметры из окружения."
       );
     }
     const record = await this.db.getServerByKey(serverKey);
-    if (record?.relayManaged) {
+    if (record?.status === "pending") {
+      throw new Error("Дождитесь завершения установки сервера перед удалением.");
+    }
+    if (cleanRemote) {
+      if (!record?.relayManaged || !record.sshPrivateKey || record.hostFingerprint === "pending") {
+        throw new Error("Нет управляющего доступа для очистки. Можно удалить только из бота.");
+      }
       const target = this.targetFor(record);
-      if (target?.privateKey && target.hostFingerprint !== "pending") await this.gateway.stopManagedRelay(target);
+      if (!target) throw new Error("Сервер не найден.");
+      await this.gateway.cleanupManagedServer(target);
     }
     return this.db.deleteServer(serverKey);
   }
@@ -431,6 +441,7 @@ RELAY_UNIT
 systemctl daemon-reload
 systemctl enable --now vpnbot-relay-tunnel.service
 systemctl restart vpnbot-relay-tunnel.service
+printf '%s\\n' 'SRV_KEY_PLACEHOLDER' > /etc/vpnbot-relay/server-key
 VPNBOT_STAGE=openvpn_check
 timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1194'
 VPNBOT_STAGE=relay_check

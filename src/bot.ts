@@ -885,25 +885,43 @@ export function createBot(
     await edit(
       ctx,
       [
-        `🗑 Удалить сервер «${server.record.name}» из бота?`,
+        `🗑 Как удалить сервер «${server.record.name}»?`,
         "",
         `Связанных конфигов в базе: ${impact.configs}`,
         `Импортированных клиентов: ${impact.legacyClients}`,
         `Ожидающих отзывов: ${impact.pendingRevocations}`,
         "",
-        "Сами пользовательские конфиги и история трафика сохранятся, но операции с ними через этот сервер станут недоступны. На VPS ничего удаляться не будет.",
+        "Только из бота — без SSH, даже если VPS недоступен. Файлы и службы на VPS останутся.",
+        "С очисткой — подключиться к VPS, остановить OpenVPN и relay, удалить VPN-ключи и конфиги. Потребуется отдельное подтверждение.",
+        "Пользовательские записи и история трафика сохранятся. Перед удалением рабочего сервера перенесите пользователей.",
       ].join("\n"),
       new InlineKeyboard()
-        .text("🗑 Да, удалить из бота", `svdc|${server.record.key}`)
+        .text("🗑 Только из бота", `svdc|${server.record.key}`)
+        .row()
+        .text("🧹 Из бота и очистить VPS", `svdp|${server.record.key}`)
         .row()
         .text("❌ Отмена", `svo|${server.record.key}`)
     );
   });
 
-  bot.callbackQuery(/^svdc\|(.+)$/, async (ctx) => {
+  bot.callbackQuery(/^svdp\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    if (ctx.match[1] === egress?.entryKey) return showAlert(ctx, "Московскую точку входа нельзя удалить из аварийного управления.");
+    if (ctx.match[1] === egress?.entryKey || ctx.match[1] === appConfig.entryServerKey)
+      return showAlert(ctx, "Московскую точку входа нельзя удалить.");
     const server = await serverManager.getServer(ctx.match[1]!);
+    if (!server) return showAlert(ctx, "Сервер не найден.");
+    await ctx.answerCallbackQuery();
+    await edit(ctx,
+      `⚠️ Очистить VPS «${server.record.name}» (${server.record.host}) и удалить из бота?\n\nБудут остановлены OpenVPN и обратный SSH-туннель, удалены их конфиги, сертификаты и ключи. Старые VPN-файлы этого сервера перестанут работать. Другие приложения и ОС не удаляются.\n\nЕсли очистка не завершится, запись останется в боте. VPS может оказаться частично очищенным; повторите операцию или выберите удаление только из бота.`,
+      new InlineKeyboard().text("🧹 Подтверждаю очистку", `svdcc|${server.record.key}`).row()
+        .text("⬅️ Назад", `svd|${server.record.key}`));
+  });
+
+  bot.callbackQuery(/^(svdc|svdcc)\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (ctx.match[2] === egress?.entryKey || ctx.match[2] === appConfig.entryServerKey) return showAlert(ctx, "Московскую точку входа нельзя удалить из аварийного управления.");
+    const cleanRemote = ctx.match[1] === "svdcc";
+    const server = await serverManager.getServer(ctx.match[2]!);
     if (!server) return showAlert(ctx, "Сервер уже удалён.");
     const lockKey = `server-delete:${server.record.key}`;
     if (operationLocks.has(lockKey))
@@ -911,10 +929,10 @@ export function createBot(
     operationLocks.add(lockKey);
     await ctx.answerCallbackQuery({ text: "Удаляю сервер…" });
     try {
-      const impact = await serverManager.deleteServer(server.record.key);
+      const impact = await serverManager.deleteServer(server.record.key, cleanRemote);
       await edit(
         ctx,
-        `✅ Сервер «${server.record.name}» удалён из бота.\n\nСохранено пользовательских конфигов: ${impact.configs}.`,
+        `✅ Сервер «${server.record.name}» удалён из бота.${cleanRemote ? " VPN-инфраструктура на VPS очищена." : " На VPS ничего не менялось."}\n\nСохранено пользовательских записей конфигов: ${impact.configs}.`,
         new InlineKeyboard()
           .text("🖥 К серверам", "sv")
           .row()

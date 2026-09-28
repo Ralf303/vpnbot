@@ -115,6 +115,14 @@ export class OpenVpnGateway {
     });
   }
 
+  async cleanupManagedServer(server: VpnServerTarget): Promise<void> {
+    if (!/^srv_[1-9][0-9]*$/.test(server.key))
+      throw new Error("Очистка доступна только для серверов, добавленных ботом.");
+    const result = await this.execute(server, ["cleanup", server.key]);
+    if (result.toString("utf8").trim() !== "VPNBOT_CLEANUP_OK")
+      throw new Error("VPS не подтвердил очистку. Запись сервера сохранена.");
+  }
+
   private async execute(server: VpnServerTarget, args: string[]): Promise<Buffer> {
     const command = [server.helperCommand, ...args].join(" ");
     return runSshCommand({
