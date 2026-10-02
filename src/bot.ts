@@ -1,4 +1,5 @@
 import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
+import { readFile } from "node:fs/promises";
 import type { MessageEntity } from "grammy/types";
 import { DateTime } from "luxon";
 import { SocksProxyAgent } from "socks-proxy-agent";
@@ -754,7 +755,29 @@ export function createBot(
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     pendingInputs.delete(String(ctx.from.id));
     await ctx.answerCallbackQuery();
-    await showAdminMain(ctx, db);
+    await showAdminMain(ctx, db, Boolean(appConfig.gameAdminProfilePath));
+  });
+
+  bot.callbackQuery("gp", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    if (ctx.chat?.type !== "private")
+      return showAlert(ctx, "Игровой профиль можно получить только в личном чате с ботом.");
+    const path = appConfig.gameAdminProfilePath;
+    if (!path) return showAlert(ctx, "Игровой профиль ещё не настроен.");
+    await ctx.answerCallbackQuery({ text: "Подготавливаю игровой профиль…" });
+    try {
+      const profile = await readFile(path);
+      const text = profile.toString("utf8");
+      if (profile.length > 8192 || !text.includes("[Interface]") ||
+          !text.includes("PrivateKey = ") || !text.includes("[Peer]") ||
+          !text.includes("Endpoint = ")) throw new Error("Invalid gaming profile");
+      await ctx.replyWithDocument(new InputFile(profile, "gaming-germany.conf"), {
+        caption: "🎮 Личный игровой профиль WireGuard для прямого подключения к Германии. Перед его включением отключите обычный VPN; после гонки можно снова включить обычный профиль. Этот файл содержит закрытый ключ — не пересылайте его.",
+        reply_markup: new InlineKeyboard().text("🛠 Админ-панель", "a"),
+      });
+    } catch {
+      await ctx.reply("Не удалось получить игровой профиль. Сообщите администратору сервера.");
+    }
   });
 
   bot.callbackQuery("at", async (ctx) => {
@@ -1014,7 +1037,7 @@ export function createBot(
     pendingInputs.delete(telegramId);
     broadcastDrafts.delete(telegramId);
     await ctx.answerCallbackQuery({ text: "Рассылка отменена." });
-    await showAdminMain(ctx, db);
+    await showAdminMain(ctx, db, Boolean(appConfig.gameAdminProfilePath));
   });
 
   bot.callbackQuery(/^bcc(f)?$/, async (ctx) => {
@@ -1529,7 +1552,8 @@ async function showUserConfig(
 
 async function showAdminMain(
   ctx: Context,
-  db: AppDatabase
+  db: AppDatabase,
+  gameProfileReady = false
 ): Promise<void> {
   const stats = await db.stats();
 
@@ -1541,24 +1565,23 @@ async function showAdminMain(
     `🟢 Активных конфигов: ${stats.active}`,
     `🔴 Просроченных в меню: ${stats.expired}`,
   ].join("\n");
-  await edit(
-    ctx,
-    text,
-    new InlineKeyboard()
-      .text("🔎 Найти пользователя", "as")
-      .row()
-      .text("🖥 Серверы", "sv")
-      .row()
-      .text("🌍 Аварийное управление", "eg_list")
-      .row()
-      .text("📣 Рассылка", "bc")
-      .row()
-      .text("⏳ Продлить все конфиги", "ax")
-      .row()
-      .text("📊 Статистика", "at")
-      .row()
-      .text("🏠 Главное меню", "m")
-  );
+  const keyboard = new InlineKeyboard()
+    .text("🔎 Найти пользователя", "as")
+    .row()
+    .text("🖥 Серверы", "sv")
+    .row()
+    .text("🌍 Аварийное управление", "eg_list")
+    .row();
+  if (gameProfileReady) keyboard.text("🎮 Игровой профиль", "gp").row();
+  keyboard
+    .text("📣 Рассылка", "bc")
+    .row()
+    .text("⏳ Продлить все конфиги", "ax")
+    .row()
+    .text("📊 Статистика", "at")
+    .row()
+    .text("🏠 Главное меню", "m");
+  await edit(ctx, text, keyboard);
 }
 
 async function showTrafficStats(

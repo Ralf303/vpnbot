@@ -1,0 +1,4 @@
+services:
+  bot:
+    volumes:
+      - ./secrets/game_admin_profile:/run/secrets/game_admin_profile:ro
