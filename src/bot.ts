@@ -771,8 +771,8 @@ export function createBot(
       if (profile.length > 8192 || !text.includes("[Interface]") ||
           !text.includes("PrivateKey = ") || !text.includes("[Peer]") ||
           !text.includes("Endpoint = ")) throw new Error("Invalid gaming profile");
-      await ctx.replyWithDocument(new InputFile(profile, "gaming-germany.conf"), {
-        caption: "🎮 Личный игровой профиль WireGuard для прямого подключения к Германии. Перед его включением отключите обычный VPN; после гонки можно снова включить обычный профиль. Этот файл содержит закрытый ключ — не пересылайте его.",
+      await ctx.replyWithDocument(new InputFile(profile, "gaming-via-moscow.conf"), {
+        caption: "🎮 Личный игровой профиль WireGuard для теста: подключение через Москву, выход в Германии. Перед его включением отключите обычный VPN; после гонки можно снова включить обычный профиль. Этот файл содержит закрытый ключ — не пересылайте его.",
         reply_markup: new InlineKeyboard().text("🛠 Админ-панель", "a"),
       });
     } catch {

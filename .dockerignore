@@ -5,6 +5,7 @@ data
 src/generated/prisma
 .env
 .git
+secrets/
 *.key
 *.pem
 *.ovpn

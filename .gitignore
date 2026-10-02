@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/
 .tmp/
+secrets/
 src/generated/prisma/
 .env
 *.log
