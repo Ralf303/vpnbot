@@ -25,6 +25,7 @@ model User {
   telegramId String?     @unique @map("telegram_id")
   username   String?
   firstName  String      @map("first_name")
+  gameEnabled Boolean    @default(false) @map("game_enabled")
   createdAt  DateTime    @default(now()) @db.Timestamptz(3) @map("created_at")
   updatedAt  DateTime    @updatedAt @db.Timestamptz(3) @map("updated_at")
   configs    VpnConfig[]

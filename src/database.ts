@@ -26,6 +26,7 @@ function mapUser(row: User): UserRecord {
     telegramId: row.telegramId,
     username: row.username,
     firstName: row.firstName,
+    gameEnabled: row.gameEnabled,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -217,6 +218,13 @@ export class AppDatabase {
   async getUserById(id: number): Promise<UserRecord | null> {
     const row = await this.prisma.user.findUnique({ where: { id } });
     return row ? mapUser(row) : null;
+  }
+
+  async setGameEnabled(userId: number, enabled: boolean): Promise<UserRecord> {
+    return mapUser(await this.prisma.user.update({
+      where: { id: userId },
+      data: { gameEnabled: enabled },
+    }));
   }
 
   async searchUsers(query: string): Promise<UserRecord[]> {

@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Root-only, narrowly scoped WireGuard peer management for the gaming entry."""
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+BASE = Path("/var/lib/vpnbot-game")
+CONF = Path("/etc/wireguard/wg-game-ru.conf")
+SERVER_PUB = Path("/etc/wireguard/wg-game-ru.pub")
+INTERFACE = "wg-game-ru"
+TAG = "vpnbot-game-user"
+
+
+def run(*args, input_text=None, check=True):
+    result = subprocess.run(args, input=input_text, text=True, capture_output=True, check=False)
+    if check and result.returncode:
+        raise RuntimeError(f"{args[0]} failed ({result.returncode}): {result.stderr.strip()}")
+    return result
+
+
+def atomic_write(path, text):
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".game-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def active():
+    return run("wg", "show", INTERFACE, "public-key", check=False).returncode == 0
+
+
+def state_path(user_id):
+    return BASE / f"user-{user_id}.json"
+
+
+def states():
+    for path in BASE.glob("user-*.json"):
+        if re.fullmatch(r"user-[1-9][0-9]*\.json", path.name):
+            yield json.loads(path.read_text())
+
+
+def peer_block(user_id, address, public_key):
+    return (f"\n# vpnbot-game-user {user_id}\n[Peer]\n"
+            f"PublicKey = {public_key}\nAllowedIPs = {address}/32\n"
+            f"# end-vpnbot-game-user {user_id}\n")
+
+
+def remove_block(user_id):
+    text = CONF.read_text()
+    pattern = rf"\n# vpnbot-game-user {user_id}\n.*?# end-vpnbot-game-user {user_id}\n"
+    updated, count = re.subn(pattern, "", text, count=1, flags=re.S)
+    if count:
+        atomic_write(CONF, updated)
+
+
+def rule_commands(address):
+    return [
+        ["ip", "rule", "add", "pref", "12002", "from", f"{address}/32", "lookup", "23001"],
+        ["iptables", "-w", "-I", "DOCKER-USER", "1", "-i", INTERFACE,
+         "-s", f"{address}/32", "-o", "wg-de", "-m", "comment", "--comment", TAG, "-j", "ACCEPT"],
+        ["iptables", "-w", "-I", "DOCKER-USER", "1", "-i", "wg-de",
+         "-o", INTERFACE, "-d", f"{address}/32", "-m", "conntrack", "--ctstate",
+         "RELATED,ESTABLISHED", "-m", "comment", "--comment", TAG, "-j", "ACCEPT"],
+        ["iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "-s", f"{address}/32",
+         "-o", "wg-de", "-m", "comment", "--comment", TAG,
+         "-j", "SNAT", "--to-source", "10.9.0.1"],
+    ]
+
+
+def has_rule(args):
+    if args[0] == "ip":
+        return f"from {args[6].removesuffix('/32')} lookup 23001" in run("ip", "rule", "show").stdout
+    check_args = args.copy()
+    check_args[check_args.index("-I")] = "-C"
+    check_args.remove("1")
+    return run(*check_args, check=False).returncode == 0
+
+
+def add_rules(address):
+    for args in rule_commands(address):
+        if not has_rule(args):
+            run(*args)
+
+
+def remove_rules(address):
+    for args in reversed(rule_commands(address)):
+        if not has_rule(args):
+            continue
+        if args[0] == "ip":
+            args = args.copy()
+            args[2] = "del"
+        else:
+            args = args.copy()
+            args[args.index("-I")] = "-D"
+            args.remove("1")
+        run(*args)
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) not in (2, 3):
+        raise ValueError("invalid invocation")
+    action = sys.argv[1]
+    if action not in ("enable", "get", "disable", "restore", "cleanup"):
+        raise ValueError("invalid action")
+    if action in ("restore", "cleanup"):
+        if len(sys.argv) != 2:
+            raise ValueError("unexpected user")
+    elif len(sys.argv) != 3 or not re.fullmatch(r"[1-9][0-9]{0,8}", sys.argv[2]):
+        raise ValueError("invalid user")
+    BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (BASE / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if action in ("restore", "cleanup"):
+            for state in states():
+                if action == "restore":
+                    add_rules(state["address"])
+                else:
+                    remove_rules(state["address"])
+            return
+        user_id = int(sys.argv[2])
+        path = state_path(user_id)
+        if action == "get":
+            if not path.exists():
+                raise ValueError("gaming profile not enabled")
+            sys.stdout.write(json.loads(path.read_text())["profile"])
+            return
+        if action == "disable":
+            if not path.exists():
+                return
+            state = json.loads(path.read_text())
+            if active():
+                run("wg", "set", INTERFACE, "peer", state["public_key"], "remove")
+            remove_rules(state["address"])
+            remove_block(user_id)
+            path.unlink()
+            return
+        if not active():
+            raise RuntimeError("gaming interface is down")
+        if path.exists():
+            state = json.loads(path.read_text())
+            run("wg", "set", INTERFACE, "peer", state["public_key"],
+                "allowed-ips", f'{state["address"]}/32')
+            add_rules(state["address"])
+            sys.stdout.write(state["profile"])
+            return
+        occupied = {state["address"] for state in states()}
+        address = next((f"10.219.0.{i}" for i in range(3, 255)
+                        if f"10.219.0.{i}" not in occupied), None)
+        if not address:
+            raise RuntimeError("gaming address pool exhausted")
+        private_key = run("wg", "genkey").stdout.strip()
+        public_key = run("wg", "pubkey", input_text=private_key + "\n").stdout.strip()
+        server_public = SERVER_PUB.read_text().strip()
+        profile = ("[Interface]\n" + f"PrivateKey = {private_key}\nAddress = {address}/32\n"
+                   "DNS = 1.1.1.1, 9.9.9.9\nMTU = 1360\n\n[Peer]\n"
+                   f"PublicKey = {server_public}\nEndpoint = 77.91.93.234:51823\n"
+                   "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n")
+        state = {"address": address, "public_key": public_key, "profile": profile}
+        try:
+            atomic_write(path, json.dumps(state))
+            atomic_write(CONF, CONF.read_text() + peer_block(user_id, address, public_key))
+            run("wg", "set", INTERFACE, "peer", public_key, "allowed-ips", f"{address}/32")
+            add_rules(address)
+        except Exception:
+            run("wg", "set", INTERFACE, "peer", public_key, "remove", check=False)
+            remove_rules(address)
+            remove_block(user_id)
+            path.unlink(missing_ok=True)
+            raise
+        sys.stdout.write(profile)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

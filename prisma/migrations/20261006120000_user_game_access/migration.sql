@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "game_enabled" BOOLEAN NOT NULL DEFAULT false;

@@ -5,6 +5,7 @@ import type { UserRecord, VpnConfigRecord } from "./domain.js";
 import { labeledVpnFileName, vpnFileName } from "./file-name.js";
 import type { ServerManager } from "./server-manager.js";
 import type { EgressService } from "./egress-service.js";
+import type { GameProfileService } from "./game-profile-service.js";
 import { EgressAdmin, type EmergencyReply } from "./egress-admin.js";
 import { formatDate, isExpired } from "./time.js";
 import type { TrafficService } from "./traffic-service.js";
@@ -65,7 +66,7 @@ export class VkBot {
     private readonly trafficService: TrafficService,
     private readonly serverManager: ServerManager,
     private readonly timezone: string,
-    private readonly options: { egress?: EgressService | undefined; adminTelegramId?: string | undefined; adminVkId?: string | undefined } = {}
+    private readonly options: { egress?: EgressService | undefined; adminTelegramId?: string | undefined; adminVkId?: string | undefined; gameProfiles?: GameProfileService | undefined } = {}
   ) { this.emergency = options.egress ? new EgressAdmin(options.egress) : undefined; }
 
   private async isEmergencyAdmin(vkId: number, peerId: number): Promise<boolean> {
@@ -188,7 +189,7 @@ export class VkBot {
       await this.api.sendMessage({
         peerId: message.peer_id,
         message: "✅ VK успешно связан с Вашим аккаунтом Telegram. Конфиги и сроки теперь общие.",
-        keyboard: mainKeyboard(),
+        keyboard: mainKeyboard(false, Boolean(linked.gameEnabled && this.options.gameProfiles?.ready)),
       });
       return;
     }
@@ -254,6 +255,25 @@ export class VkBot {
     if (!action) return this.showMain(peerId, conversationMessageId);
 
     if (action.a === "main") return this.showMain(peerId, conversationMessageId);
+    if (action.a === "game") {
+      if (vkId !== peerId || !user.gameEnabled || !this.options.gameProfiles?.ready) {
+        await this.api.sendMessage({ peerId, message: "Игровой профиль недоступен." });
+        return;
+      }
+      try {
+        const file = await this.options.gameProfiles.download(user.id);
+        await this.api.sendDocument({
+          peerId,
+          file,
+          fileName: "gaming-via-moscow.conf",
+          message: "🎮 Ваш личный игровой профиль WireGuard. Перед включением отключите обычный VPN. Файл содержит закрытый ключ — не пересылайте его.",
+        });
+      } catch (error) {
+        console.error("Не удалось выдать игровой профиль VK", error);
+        await this.api.sendMessage({ peerId, message: "Не удалось получить игровой профиль. Обратитесь к администратору." });
+      }
+      return;
+    }
     if (action.a === "help") return this.showHelp(peerId, conversationMessageId);
     if (action.a === "list") {
       return this.showConfigs(
@@ -310,11 +330,12 @@ export class VkBot {
     peerId: number,
     conversationMessageId?: number
   ): Promise<void> {
+    const user = await this.db.getUserByVkId(String(peerId));
     await this.sendOrEdit({
       peerId,
       conversationMessageId,
       message: "👋 VPN-бот\n\nЗдесь можно получить конфиги, проверить срок действия и сменить сервер выхода.",
-      keyboard: mainKeyboard(await this.isEmergencyAdmin(peerId, peerId)),
+      keyboard: mainKeyboard(await this.isEmergencyAdmin(peerId, peerId), Boolean(user?.gameEnabled && this.options.gameProfiles?.ready)),
     });
   }
 
@@ -634,10 +655,11 @@ export function vkRequiresTelegramLink(
   return !user?.telegramId;
 }
 
-function mainKeyboard(admin = false): string {
+function mainKeyboard(admin = false, gameEnabled = false): string {
   return keyboard([
     [button("🔐 Мои конфиги", { a: "list" }, "primary")],
     [button("📦 Получить все файлы", { a: "all" }, "positive")],
+    ...(gameEnabled ? [[button("🎮 Игровой профиль", { a: "game" }, "positive")]] : []),
     [button("ℹ️ Помощь", { a: "help" })],
     ...(admin ? [[button("🛠 Аварийное управление", { a: "eg_list" })]] : []),
   ]);

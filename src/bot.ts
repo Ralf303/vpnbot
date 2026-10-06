@@ -9,6 +9,7 @@ import { broadcastText, broadcastChannels, formatBroadcastReport, vkBroadcastTex
 import { massExtensionPeriod, parseExtensionDays } from "./mass-extension.js";
 import type { VkApiClient } from "./vk-api.js";
 import type { EgressService } from "./egress-service.js";
+import type { GameProfileService } from "./game-profile-service.js";
 import { EgressAdmin, type EmergencyReply } from "./egress-admin.js";
 import { keyboard as vkKeyboard } from "./vk-bot.js";
 import { ConfigService } from "./config-service.js";
@@ -65,7 +66,8 @@ export function createBot(
   trafficService: TrafficService,
   serverManager: ServerManager,
   vkApi?: VkApiClient,
-  egress?: EgressService
+  egress?: EgressService,
+  gameProfiles?: GameProfileService
 ): BotApplication {
   const bot = new Bot(
     appConfig.botToken,
@@ -157,13 +159,15 @@ export function createBot(
 
   bot.command("start", async (ctx) => {
     pendingInputs.delete(String(ctx.from?.id ?? ""));
+    const user = ctx.from ? await db.getUserByTelegramId(String(ctx.from.id)) : null;
     await ctx.reply(
       "👋 Добро пожаловать! Здесь Вы можете получить свои VPN-конфиги и проверить срок их действия.",
       {
         reply_markup: mainKeyboard(
           isAdmin(ctx, appConfig),
           appConfig.contactUrl,
-          Boolean(appConfig.vk)
+          Boolean(appConfig.vk),
+          Boolean(gameProfiles?.ready && user?.gameEnabled)
         ),
       }
     );
@@ -174,11 +178,13 @@ export function createBot(
     const telegramId = String(ctx.from.id);
     const pending = pendingInputs.get(telegramId);
     if (!pending) {
+      const user = await db.getUserByTelegramId(telegramId);
       await ctx.reply("Выберите действие с помощью кнопок ниже.", {
         reply_markup: mainKeyboard(
           isAdmin(ctx, appConfig),
           appConfig.contactUrl,
-          Boolean(appConfig.vk)
+          Boolean(appConfig.vk),
+          Boolean(gameProfiles?.ready && user?.gameEnabled)
         ),
       });
       return;
@@ -401,13 +407,15 @@ export function createBot(
   bot.callbackQuery("m", async (ctx) => {
     pendingInputs.delete(String(ctx.from.id));
     await ctx.answerCallbackQuery();
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
     await edit(
       ctx,
       "🏠 Личный кабинет",
       mainKeyboard(
         isAdmin(ctx, appConfig),
         appConfig.contactUrl,
-        Boolean(appConfig.vk)
+        Boolean(appConfig.vk),
+        Boolean(gameProfiles?.ready && user?.gameEnabled)
       )
     );
   });
@@ -519,6 +527,22 @@ export function createBot(
     await showUserConfigs(ctx, configs, 0, trafficService, serverManager);
   });
 
+  bot.callbackQuery("ug", async (ctx) => {
+    if (ctx.chat?.type !== "private") return showAlert(ctx, "Игровой профиль доступен только в личном чате.");
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
+    if (!user?.gameEnabled || !gameProfiles?.ready) return showAlert(ctx, "Игровой профиль недоступен.");
+    await ctx.answerCallbackQuery({ text: "Подготавливаю игровой профиль…" });
+    try {
+      const profile = await gameProfiles.download(user.id);
+      await ctx.replyWithDocument(new InputFile(profile, "gaming-via-moscow.conf"), {
+        caption: "🎮 Ваш личный игровой профиль WireGuard. Перед включением отключите обычный VPN. Файл содержит закрытый ключ — не пересылайте его.",
+      });
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Не удалось получить игровой профиль. Обратитесь к администратору.");
+    }
+  });
+
   bot.callbackQuery(/^ulp\|(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
@@ -596,7 +620,8 @@ export function createBot(
           reply_markup: mainKeyboard(
             isAdmin(ctx, appConfig),
             appConfig.contactUrl,
-            Boolean(appConfig.vk)
+            Boolean(appConfig.vk),
+            Boolean(gameProfiles?.ready && user.gameEnabled)
           ),
         }
       );
@@ -1120,7 +1145,41 @@ export function createBot(
     const user = await db.getUserById(Number(ctx.match[1]));
     if (!user) return showAlert(ctx, "Пользователь не найден.");
     await ctx.answerCallbackQuery();
-    await showAdminUser(ctx, user, db, trafficService, 0);
+    await showAdminUser(ctx, user, db, trafficService, 0, gameProfiles?.ready);
+  });
+
+  bot.callbackQuery(/^aug\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig) || ctx.chat?.type !== "private") return showAlert(ctx, "Недостаточно прав.");
+    const user = await db.getUserById(Number(ctx.match[1]));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    if (!gameProfiles?.ready) return showAlert(ctx, "Игровой сервер не настроен.");
+    const lock = `game:${user.id}`;
+    if (operationLocks.has(lock)) return showAlert(ctx, "Операция уже выполняется.");
+    operationLocks.add(lock);
+    await ctx.answerCallbackQuery({ text: "Меняю доступ…" });
+    try {
+      if (user.gameEnabled) {
+        await gameProfiles.disable(user.id);
+        await db.setGameEnabled(user.id, false);
+      } else {
+        await gameProfiles.enable(user.id);
+        try {
+          await db.setGameEnabled(user.id, true);
+        } catch (error) {
+          await gameProfiles.disable(user.id).catch(logError);
+          throw error;
+        }
+      }
+      const updated = await db.getUserById(user.id);
+      if (updated) await showAdminUser(ctx, updated, db, trafficService, 0, gameProfiles.ready);
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Не удалось изменить доступ к игровому профилю. Попробуйте ещё раз.", {
+        reply_markup: new InlineKeyboard().text("К пользователю", `au|${user.id}`),
+      });
+    } finally {
+      operationLocks.delete(lock);
+    }
   });
 
   bot.callbackQuery(/^aup\|(\d+)\|(\d+)$/, async (ctx) => {
@@ -1133,7 +1192,8 @@ export function createBot(
       user,
       db,
       trafficService,
-      Number(ctx.match[2])
+      Number(ctx.match[2]),
+      gameProfiles?.ready
     );
   });
 
@@ -1459,7 +1519,8 @@ export function createBot(
 function mainKeyboard(
   admin: boolean,
   contactUrl: string,
-  vkEnabled = false
+  vkEnabled = false,
+  gameEnabled = false
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard()
     .text("🗂 Мои конфиги", "ul")
@@ -1468,6 +1529,7 @@ function mainKeyboard(
     .row()
     .text("📖 Как установить", "help");
   if (vkEnabled) keyboard.row().text("🔗 Связать VK", "lvk");
+  if (gameEnabled) keyboard.row().text("🎮 Игровой профиль", "ug");
   if (admin) keyboard.row().text("🛠 Админ-панель", "a");
   return keyboard;
 }
@@ -1734,7 +1796,8 @@ async function showAdminUser(
   user: UserRecord,
   db: AppDatabase,
   trafficService: TrafficService,
-  requestedPage: number
+  requestedPage: number,
+  gameReady = false
 ): Promise<void> {
   const configs = await db.listConfigsForUserAdmin(user.id);
   const { page, totalPages, items } = paginateConfigs(configs, requestedPage);
@@ -1752,10 +1815,11 @@ async function showAdminUser(
   );
   keyboard.text("➕ Выдать новый конфиг", `ai|${user.id}`).row();
   keyboard.text("🔗 Привязать старый конфиг", `ab|${user.id}`).row();
+  if (gameReady) keyboard.text(user.gameEnabled ? "🎮 Отключить игровой профиль" : "🎮 Открыть игровой профиль", `aug|${user.id}`).row();
   keyboard.text("🔎 Новый поиск", "as").text("🛠 Админ-панель", "a");
   await edit(
     ctx,
-    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}\n\n🟢 срок действует\n🔴 срок истёк\n🔌 подключён\n⚪ не подключён\n❔ нет данных\n\nСтраница ${page + 1} из ${totalPages}`,
+    `Пользователь: ${userLabel(user)}\nКонфигов: ${configs.length}\nИгровой профиль: ${user.gameEnabled ? "доступен" : "не выдан"}\n\n🟢 срок действует\n🔴 срок истёк\n🔌 подключён\n⚪ не подключён\n❔ нет данных\n\nСтраница ${page + 1} из ${totalPages}`,
     keyboard
   );
 }

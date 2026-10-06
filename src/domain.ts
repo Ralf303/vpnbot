@@ -7,6 +7,7 @@ export interface UserRecord {
   telegramId: string | null;
   username: string | null;
   firstName: string;
+  gameEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }

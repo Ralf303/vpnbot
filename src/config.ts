@@ -41,6 +41,7 @@ const schema = z.object({
     .default("true")
     .transform((value) => value === "true"),
   GAME_ADMIN_PROFILE_PATH: optionalString,
+  GAME_SSH_HOST: optionalString,
   NEW_VPN_NAME: z.string().default("Новый сервер"),
   NEW_VPN_HOST: optionalString,
   NEW_VPN_PORT: z.coerce.number().int().min(1).max(65535).default(22),
@@ -87,6 +88,7 @@ export interface AppConfig {
   } | undefined;
   helperCommand: string;
   gameAdminProfilePath: string | undefined;
+  gameSshHost: string | undefined;
   bootstrapPublicKey: string | undefined;
   telegramProxyUrl: string | undefined;
   sshProxyUrl: string | undefined;
@@ -223,6 +225,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       : undefined,
     helperCommand: parsed.VPN_HELPER_COMMAND,
     gameAdminProfilePath: parsed.GAME_ADMIN_PROFILE_PATH,
+    gameSshHost: parsed.GAME_SSH_HOST,
     bootstrapPublicKey: parsed.VPN_BOOTSTRAP_PUBLIC_KEY_PATH
       ? readFileSync(parsed.VPN_BOOTSTRAP_PUBLIC_KEY_PATH, "utf8").trim()
       : undefined,

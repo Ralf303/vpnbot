@@ -11,6 +11,7 @@ import { VkApiClient } from "./vk-api.js";
 import { VkBot } from "./vk-bot.js";
 import { EgressService } from "./egress-service.js";
 import { runTelegramWithRetry } from "./telegram-runtime.js";
+import { GameProfileService } from "./game-profile-service.js";
 
 const config = loadConfig();
 const db = new AppDatabase(config.databaseUrl);
@@ -21,8 +22,9 @@ const serverManager = new ServerManager(db, vpn, config);
 const egress = config.entryServerKey ? new EgressService(db, serverManager, config.entryServerKey) : undefined;
 const configService = new ConfigService(db, vpn, serverManager, config.vpnProfile);
 const trafficService = new TrafficService(db, vpn, serverManager);
+const gameProfiles = new GameProfileService(config, serverManager);
 const vkApi = config.vk ? new VkApiClient(config.vk.token, config.vk.groupId) : undefined;
-const { bot } = createBot(config, db, configService, trafficService, serverManager, vkApi, egress);
+const { bot } = createBot(config, db, configService, trafficService, serverManager, vkApi, egress, gameProfiles);
 const jobs = new BackgroundJobs(bot, db, vpn, config, trafficService, serverManager);
 const vkBot = vkApi
   ? new VkBot(
@@ -32,7 +34,7 @@ const vkBot = vkApi
       trafficService,
       serverManager,
       config.timezone,
-      { egress, adminTelegramId: config.adminTelegramId, adminVkId: config.adminVkId }
+      { egress, adminTelegramId: config.adminTelegramId, adminVkId: config.adminVkId, gameProfiles }
     )
   : null;
 
