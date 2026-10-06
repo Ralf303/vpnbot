@@ -84,8 +84,10 @@ def has_rule(args):
     if args[0] == "ip":
         return f"from {args[6].removesuffix('/32')} lookup 23001" in run("ip", "rule", "show").stdout
     check_args = args.copy()
-    check_args[check_args.index("-I")] = "-C"
-    check_args.remove("1")
+    insert = check_args.index("-I")
+    check_args[insert] = "-C"
+    if check_args[insert + 2] == "1":
+        check_args.pop(insert + 2)
     return run(*check_args, check=False).returncode == 0
 
 
@@ -104,8 +106,10 @@ def remove_rules(address):
             args[2] = "del"
         else:
             args = args.copy()
-            args[args.index("-I")] = "-D"
-            args.remove("1")
+            insert = args.index("-I")
+            args[insert] = "-D"
+            if args[insert + 2] == "1":
+                args.pop(insert + 2)
         run(*args)
 
 
