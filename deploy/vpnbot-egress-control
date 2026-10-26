@@ -134,6 +134,16 @@ add rule inet vpnbot_exits classify iifname "tun1" meta mark 0x210 meta mark set
         command(['nft', '-f', '-'], input=script)
         atomic(fingerprint, digest)
 
+def ensure_policy_rules(state):
+    rules = command(['ip', '-4', 'rule', 'show'])
+    for n in state['nodes']:
+        if n['status'] != 'ready':
+            continue
+        pref = str(12000 + int(n['id'][1:]))
+        if not re.search(r'^' + pref + r':', rules, re.M):
+            table = str(n['table'])
+            command(['ip', '-4', 'rule', 'add', 'pref', pref, 'fwmark', table, 'lookup', table])
+
 def apply(state):
     for n in state['nodes']:
         if n['status'] != 'ready':
@@ -147,10 +157,7 @@ def apply(state):
         command(['ip', '-4', 'route', 'replace', 'blackhole', 'default', 'metric', '32767', 'table', table])
         if subprocess.run(['ip', 'link', 'show', n['interface']], capture_output=True).returncode == 0:
             command(['ip', '-4', 'route', 'replace', 'table', table, 'default', 'dev', n['interface'], 'metric', '10'])
-        pref = str(12000 + int(n['id'][1:]))
-        rules = command(['ip', '-4', 'rule', 'show'])
-        if not re.search(r'^' + pref + r':', rules, re.M):
-            command(['ip', '-4', 'rule', 'add', 'pref', pref, 'fwmark', table, 'lookup', table])
+    ensure_policy_rules(state)
     selected = node(state, state['default'])
     atomic('/etc/default/vpnbot-routing', f"VPN_EGRESS_INTERFACE={selected['interface']}\nVPN_EGRESS_PEER={selected['peer']}\nVPN_EGRESS_MSS=1360\n", 0o644)
     command(['/usr/local/sbin/vpnbot-route-health'])
@@ -493,7 +500,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'serve':
         serve(); return
     if len(sys.argv) > 1 and sys.argv[1] == 'tick':
-        with lock('state'): map_routes(load())
+        with lock('state'):
+            state = load()
+            ensure_policy_rules(state)
+            map_routes(state)
         return
     if len(sys.argv) > 1 and sys.argv[1] == 'reconcile':
         with lock('state'): apply(load())

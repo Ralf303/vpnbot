@@ -70,6 +70,19 @@ class ControlTest(unittest.TestCase):
         entries = c.routing_entries(fixture(), {'alice':'10.9.0.12','bob':'10.9.0.7'})
         self.assertEqual(entries, {'10.9.0.12':23001,'10.9.0.7':23002})
 
+    def test_missing_exit_policy_rule_is_restored_without_duplicate(self):
+        state = fixture()
+        with patch.object(c, 'command', return_value='12002:\tfrom all fwmark 0x59da lookup 23002') as command:
+            c.ensure_policy_rules(state)
+        self.assertEqual(command.call_args_list[0].args[0], ['ip', '-4', 'rule', 'show'])
+        self.assertEqual(command.call_args_list[1].args[0],
+                         ['ip', '-4', 'rule', 'add', 'pref', '12001', 'fwmark', '23001', 'lookup', '23001'])
+        self.assertEqual(command.call_count, 2)
+
+        with patch.object(c, 'command', return_value='12001:\tfrom all fwmark 0x59d9 lookup 23001\n12002:\tfrom all fwmark 0x59da lookup 23002') as command:
+            c.ensure_policy_rules(state)
+        self.assertEqual(command.call_count, 1)
+
     def test_password_not_written_to_registry(self):
         request = {'name':'Reserve','host':'4.2.2.2','port':22,'username':'root','password':'one-time-secret','telegram':True}
         with patch.object(c.os, 'fork', return_value=1234): c.add(request)
