@@ -1,0 +1,11 @@
+[Unit]
+Description=Check gaming VPN policy routes every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=vpnbot-game-routes.service
+
+[Install]
+WantedBy=timers.target

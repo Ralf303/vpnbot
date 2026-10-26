@@ -1,0 +1,7 @@
+[Unit]
+Description=Restore gaming VPN policy routes after network changes
+ConditionPathExists=/sys/class/net/wg-game-ru
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-game-helper restore
