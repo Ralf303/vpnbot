@@ -313,6 +313,24 @@ export class VkBot {
     if (action.a === "reissue") {
       return this.showReissueServers(config, peerId, conversationMessageId);
     }
+    if (action.a === "rotate") {
+      if (config.status !== "active" || isExpired(config.expiresAt)) {
+        await this.api.sendMessage({ peerId, message: "Просроченный конфиг нельзя перевыпустить." });
+        return;
+      }
+      return this.sendOrEdit({
+        peerId,
+        conversationMessageId,
+        message: `🔄 Перевыпустить файл «${config.displayName}»?\n\nБудет создан новый файл. Старый сертификат будет отозван: прежний файл больше не сможет подключаться. Активное соединение может сохраняться до переподключения. Удалите старый профиль из приложения и импортируйте новый. Название и срок действия сохранятся.`,
+        keyboard: keyboard([
+          [button("✅ Перевыпустить", { a: "rotate-confirm", id: config.id, server: config.clientName }, "negative")],
+          [button("❌ Отмена", { a: "cfg", id: config.id })],
+        ]),
+      });
+    }
+    if (action.a === "rotate-confirm" && action.server) {
+      return this.rotate(config, action.server, peerId);
+    }
     if (action.a === "exit-page") return this.showReissueServers(config, peerId, conversationMessageId, action.page ?? 0);
     if (action.a === "reissue-confirm" && action.server) {
       return this.reissue(config, action.server, peerId);
@@ -611,6 +629,57 @@ export class VkBot {
     }
   }
 
+  private async rotate(
+    config: VpnConfigRecord,
+    expectedClientName: string,
+    peerId: number
+  ): Promise<void> {
+    if (config.clientName !== expectedClientName) {
+      await this.api.sendMessage({ peerId, message: "Файл уже перевыпущен. Откройте конфиг заново.", keyboard: configKeyboard(config.id) });
+      return;
+    }
+    const lock = `reissue:${config.id}`;
+    if (this.operationLocks.has(lock)) return;
+    this.operationLocks.add(lock);
+    try {
+      let previousExit: string | undefined;
+      if (this.options.egress?.manages(config)) {
+        const state = await this.options.egress.snapshot();
+        previousExit = await this.options.egress.configExit(config, state);
+      }
+      const rotated = await this.configService.rotate(config, expectedClientName);
+      let exitWarning = "";
+      if (previousExit && this.options.egress) {
+        try {
+          const state = await this.options.egress.snapshot();
+          if (previousExit !== state.default)
+            await this.options.egress.assign(rotated.config, previousExit, state.revision);
+        } catch (error) {
+          console.error(`Не удалось сохранить выход VK-конфига ${config.id}`, error);
+          exitWarning = " Проверьте выбранный зарубежный выход в карточке конфига.";
+        }
+      }
+      try {
+        await this.api.sendDocument({
+          peerId,
+          file: rotated.file,
+          fileName: vpnFileName(rotated.config.clientName),
+          message: `✅ «${rotated.config.displayName}» перевыпущен. Старый файл больше не подключится. Импортируйте новый файл.${exitWarning}`,
+        });
+      } catch (error) {
+        console.error(`Не удалось отправить перевыпущенный VK-конфиг ${config.id}`, error);
+        await this.api.sendMessage({ peerId, message: "Файл перевыпущен, но отправить его не удалось. Нажмите «Получить файл» в карточке конфига.", keyboard: configKeyboard(config.id) });
+        return;
+      }
+      await this.api.sendMessage({ peerId, message: `Новый файл действует до ${formatDate(rotated.config.expiresAt, this.timezone)}.${exitWarning}`, keyboard: configKeyboard(config.id) });
+    } catch (error) {
+      console.error(`Не удалось перевыпустить VK-конфиг ${config.id}`, error);
+      await this.api.sendMessage({ peerId, message: "Перевыпуск не выполнен. Откройте карточку конфига и проверьте текущий файл; при необходимости свяжитесь с администратором.", keyboard: configKeyboard(config.id) });
+    } finally {
+      this.operationLocks.delete(lock);
+    }
+  }
+
   private async profile(userId: number): Promise<VkUserProfile> {
     const cached = this.profiles.get(userId);
     if (cached) return cached;
@@ -698,6 +767,7 @@ function configKeyboard(configId: string, active = true): string {
       button("🌍 Сменить сервер", { a: "reissue", id: configId }, "primary"),
       button("✏️ Переименовать", { a: "rename", id: configId }),
     ]);
+    rows.push([button("🔄 Перевыпустить файл", { a: "rotate", id: configId })]);
   }
   rows.push([button("⬅️ К конфигам", { a: "list" })]);
   return keyboard(rows);

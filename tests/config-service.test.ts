@@ -231,6 +231,23 @@ describe("ConfigService", () => {
     );
   });
 
+  it("перевыпускает файл на том же сервере с немедленным отзывом старого сертификата", async () => {
+    const user = await db.upsertUser({ telegramId: "106", firstName: "Ирина" });
+    const original = await service.issue(user, "2027-03-01T20:59:59.999Z");
+    await db.updateDisplayName(original.id, "Мой телефон");
+
+    const rotated = await service.rotate(original, original.clientName);
+
+    expect(rotated.config.id).toBe(original.id);
+    expect(rotated.config.displayName).toBe("Мой телефон");
+    expect(rotated.config.expiresAt).toBe(original.expiresAt);
+    expect(rotated.config.serverKey).toBe(original.serverKey);
+    expect(rotated.config.clientName).not.toBe(original.clientName);
+    expect(vpn.calls).toContain(`revoke:${original.serverKey}:${original.clientName}`);
+    expect(await db.prisma.pendingRevocation.count()).toBe(0);
+    await expect(service.rotate(original, original.clientName)).rejects.toThrow("уже был перевыпущен");
+  });
+
   it("принудительно переносит конфиг на выбранный сервер", async () => {
     const user = await db.upsertUser({ telegramId: "107", firstName: "Максим" });
     const original = await service.issue(user, "2027-05-01T20:59:59.999Z");

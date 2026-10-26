@@ -659,6 +659,72 @@ export function createBot(
     }
   });
 
+  bot.callbackQuery(/^rt\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `🔄 Перевыпустить файл «${config.displayName}»?\n\nБудет создан новый файл. Старый сертификат будет отозван: прежний файл больше не сможет подключаться. Активное соединение может сохраняться до переподключения. Удалите старый профиль из приложения и импортируйте новый. Название и срок действия сохранятся.`,
+      new InlineKeyboard()
+        .text("✅ Перевыпустить", `rtc|${config.id}|${config.clientName}`)
+        .row()
+        .text("❌ Отмена", `uc|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^rtc\|([^|]+)\|([^|]+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (config.clientName !== ctx.match[2])
+      return showAlert(ctx, "Файл уже перевыпущен. Откройте конфиг заново.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
+    if (operationLocks.has(config.id)) return showAlert(ctx, "Перевыпуск уже выполняется.");
+    operationLocks.add(config.id);
+    await ctx.answerCallbackQuery({ text: "Перевыпускаю файл…" });
+    try {
+      let previousExit: string | undefined;
+      if (egress?.manages(config)) {
+        const state = await egress.snapshot();
+        previousExit = await egress.configExit(config, state);
+      }
+      const rotated = await configService.rotate(config, ctx.match[2]!);
+      let exitWarning = "";
+      if (previousExit && egress) {
+        try {
+          const state = await egress.snapshot();
+          if (previousExit !== state.default)
+            await egress.assign(rotated.config, previousExit, state.revision);
+        } catch (error) {
+          logError(error);
+          exitWarning = " Проверьте выбранный зарубежный выход в карточке конфига.";
+        }
+      }
+      try {
+        await edit(ctx,
+          `✅ Файл «${rotated.config.displayName}» перевыпущен. Старый файл больше не подключится.${exitWarning}`,
+          new InlineKeyboard().text("🔎 Открыть конфиг", `uc|${rotated.config.id}`).row().text("🏠 Главное меню", "m"));
+        await ctx.replyWithDocument(
+          new InputFile(rotated.file, vpnFileName(rotated.config.clientName)),
+          { caption: `🔐 Новый файл для «${rotated.config.displayName}». Удалите старый профиль и импортируйте этот файл. Действует до ${formatDate(rotated.config.expiresAt, appConfig.timezone)}.${exitWarning}` }
+        );
+      } catch (deliveryError) {
+        logError(deliveryError);
+        await ctx.reply("Файл перевыпущен, но отправить его не удалось. Откройте конфиг и нажмите «Получить файл».",
+          { reply_markup: new InlineKeyboard().text("🔎 Открыть конфиг", `uc|${rotated.config.id}`) }).catch(logError);
+      }
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Перевыпуск не выполнен. Если новый файл не появился в карточке конфига, текущий оставлен без изменений. Попробуйте позднее или свяжитесь с администратором.",
+        { reply_markup: new InlineKeyboard().text("🔎 Открыть конфиг", `uc|${config.id}`) });
+    } finally {
+      operationLocks.delete(config.id);
+    }
+  });
+
   bot.callbackQuery(/^rr\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
@@ -1601,7 +1667,9 @@ async function showUserConfig(
     keyboard
       .text("📥 Получить файл", `dl|${config.id}`)
       .row()
-      .text(egress?.manages(config) ? "🌍 Сменить сервер" : "🔄 Перевыпустить файл", `rr|${config.id}`)
+      .text("🌍 Сменить сервер", `rr|${config.id}`)
+      .row()
+      .text("🔄 Перевыпустить файл", `rt|${config.id}`)
       .row();
   }
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");

@@ -36,6 +36,8 @@ function randomClientName(): string {
 }
 
 export class ConfigService {
+  private readonly rotationLocks = new Set<string>();
+
   constructor(
     private readonly db: AppDatabase,
     private readonly vpn: VpnOperations,
@@ -178,6 +180,27 @@ export class ConfigService {
     const target = await this.servers.resolveTarget(targetServerKey);
     if (!target) throw new Error("Выбранный VPN-сервер не настроен");
     return this.recreateOnServer(config, target, true);
+  }
+
+  async rotate(
+    config: VpnConfigRecord,
+    expectedClientName: string
+  ): Promise<{ config: VpnConfigRecord; file: Buffer }> {
+    if (this.rotationLocks.has(config.id)) throw new Error("Перевыпуск уже выполняется");
+    this.rotationLocks.add(config.id);
+    try {
+      const current = await this.db.getConfig(config.id);
+      if (!current || current.clientName !== expectedClientName) {
+        throw new Error("Файл уже был перевыпущен. Откройте конфиг заново.");
+      }
+      if (current.status !== "active" || isExpired(current.expiresAt)) {
+        throw new Error("Просроченный конфиг нельзя перевыпустить");
+      }
+      const target = await this.requireTarget(current.serverKey);
+      return this.recreateOnServer(current, target);
+    } finally {
+      this.rotationLocks.delete(config.id);
+    }
   }
 
   async moveToServer(

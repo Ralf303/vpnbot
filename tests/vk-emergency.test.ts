@@ -8,10 +8,10 @@ import type { TrafficService } from "../src/traffic-service.js";
 import type { EgressService } from "../src/egress-service.js";
 
 function fixture() {
-  const api={sendMessage:vi.fn(async()=>1),answerMessageEvent:vi.fn(async()=>{}),getUser:vi.fn()};
+  const api={sendMessage:vi.fn(async()=>1),sendDocument:vi.fn(async()=>1),answerMessageEvent:vi.fn(async()=>{}),getUser:vi.fn()};
   const users:Record<string,any>={'1000':{id:1,telegramId:'100'},'2000':{id:2,telegramId:'200'},'4000':{id:4,telegramId:null}};
-  const db={getUserByVkId:vi.fn(async(id:string)=>users[id]),getConfig:vi.fn(async()=>({id:'cfg',userId:2,serverKey:'entry',clientName:'original',status:'active',expiresAt:'2099-01-01'}))};
-  const configs={recreate:vi.fn()};
+  const db={getUserByVkId:vi.fn(async(id:string)=>users[id]),getConfig:vi.fn(async()=>({id:'cfg',userId:2,serverKey:'entry',clientName:'original',displayName:'Мой VPN',status:'active',expiresAt:'2099-01-01'}))};
+  const configs={recreate:vi.fn(),rotate:vi.fn(async()=>({config:{id:'cfg',userId:2,serverKey:'entry',clientName:'replacement',displayName:'Мой VPN',status:'active',expiresAt:'2099-01-01'},file:Buffer.from('new file')}))};
   const egress={snapshot:vi.fn(async()=>({revision:1,default:'e1',proxy:'e1',nodes:[{id:'e1',name:'A',host:'1.1.1.1',status:'ready',telegram:true}],assignments:{}})),manages:()=>true,assign:vi.fn(async()=>{}),configExit:vi.fn(async()=> 'e1')};
   const bot=new VkBot(api as unknown as VkApiClient,db as unknown as AppDatabase,configs as unknown as ConfigService,{} as TrafficService,{} as ServerManager,'UTC',
     {egress:egress as unknown as EgressService,adminTelegramId:'100',adminVkId:'4000'});
@@ -37,5 +37,16 @@ describe('VK emergency authorization',()=>{
     const f=fixture();const action={a:'exit-confirm',id:'cfg',server:'e2',page:1};
     await f.callback(1000,1000,action);expect(f.egress.assign).not.toHaveBeenCalled();
     await f.callback(2000,2000,action);expect(f.egress.assign).toHaveBeenCalledOnce();expect(f.configs.recreate).not.toHaveBeenCalled();
+  });
+  it('requires a separate confirmation before replacing a VK file and rejects stale confirmation',async()=>{
+    const f=fixture();
+    await f.callback(2000,2000,{a:'rotate',id:'cfg'});
+    expect(f.configs.rotate).not.toHaveBeenCalled();
+    expect(f.api.sendMessage.mock.calls.at(-1)?.[0].message).toContain('Старый сертификат будет отозван');
+    await f.callback(2000,2000,{a:'rotate-confirm',id:'cfg',server:'stale'});
+    expect(f.configs.rotate).not.toHaveBeenCalled();
+    await f.callback(2000,2000,{a:'rotate-confirm',id:'cfg',server:'original'});
+    expect(f.configs.rotate).toHaveBeenCalledOnce();
+    expect(f.api.sendDocument).toHaveBeenCalledOnce();
   });
 });
