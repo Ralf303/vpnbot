@@ -33,6 +33,7 @@ import {
   dateAfterMonths,
   dateAfterYears,
   expiryFromDate,
+  extendedExpiryDate,
   formatDate,
   isExpired,
 } from "./time.js";
@@ -1423,7 +1424,13 @@ export function createBot(
     const target = decodeDateTarget(ctx.match[1]!, ctx.match[2]!);
     if (!target) return showAlert(ctx, "Действие устарело.");
     const period = ctx.match[3]!;
-    const date = period === "6m"
+    const duration = period === "6m" ? { months: 6 } : period === "1y" ? { years: 1 } : { days: Number(period) };
+    const currentConfig = target.kind === "change" ? await db.getConfig(target.configId) : null;
+    if (target.kind === "change" && (!currentConfig || currentConfig.status === "revoked"))
+      return showAlert(ctx, "Конфиг не найден.");
+    const date = currentConfig
+      ? extendedExpiryDate(currentConfig.expiresAt, duration, appConfig.timezone)
+      : period === "6m"
       ? dateAfterMonths(6, appConfig.timezone)
       : period === "1y"
         ? dateAfterYears(1, appConfig.timezone)
@@ -1939,7 +1946,9 @@ async function showDateMenu(
   const { code, value } = encodeDateTarget(target);
   await edit(
     ctx,
-    `📅 Выберите дату окончания. Быстрые варианты считаются от сегодняшней даты (${DateTime.now().setZone(timezone).toFormat("dd.MM.yyyy")}).`,
+    target.kind === "change"
+      ? "📅 Выберите срок продления. Быстрые варианты прибавляются к текущей дате окончания конфига; если срок уже истёк — к сегодняшней дате. Указанная вручную дата задаёт точный срок окончания."
+      : `📅 Выберите дату окончания. Быстрые варианты считаются от сегодняшней даты (${DateTime.now().setZone(timezone).toFormat("dd.MM.yyyy")}).`,
     new InlineKeyboard()
       .text("+30 дней", `dt|${code}|${value}|30`)
       .text("+60 дней", `dt|${code}|${value}|60`)

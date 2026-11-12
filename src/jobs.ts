@@ -74,15 +74,19 @@ export class BackgroundJobs {
           }>;
         }
       >();
+      const adminReminders: Array<{ config: VpnConfigRecord; user: UserRecord }> = [];
 
       for (const { config, user } of await this.db.listReminderCandidates()) {
-        if (!user.telegramId) continue;
         const days = daysUntilExpiry(
           config.expiresAt,
           this.config.timezone,
           now
         );
         if (![1, 2, 3].includes(days)) continue;
+        if (days === 3 && !await this.db.notificationWasSent(config.id, "admin_expires_3", localDate)) {
+          adminReminders.push({ config, user });
+        }
+        if (!user.telegramId) continue;
         const kind = `expires_${days}`;
         if (await this.db.notificationWasSent(config.id, kind, localDate)) continue;
 
@@ -92,6 +96,21 @@ export class BackgroundJobs {
         };
         batch.items.push({ config, days, kind });
         remindersByUser.set(user.telegramId, batch);
+      }
+
+      for (const { config, user } of adminReminders) {
+        const identity = user.username ? `@${user.username}` : user.firstName;
+        const reference = user.telegramId ? `Telegram ID ${user.telegramId}` : `ID ${user.id}`;
+        try {
+          await this.bot.api.sendMessage(
+            this.config.adminTelegramId,
+            `⏳ У ${identity} (${reference}) осталось 3 дня до окончания конфига «${config.displayName}» (${formatDate(config.expiresAt, this.config.timezone)}).`,
+            { reply_markup: { inline_keyboard: [[{ text: "📅 Продлить", callback_data: `ae|${config.id}` }]] } }
+          );
+          await this.db.markNotificationsSent([{ configId: config.id, kind: "admin_expires_3" }], localDate);
+        } catch (error) {
+          console.error(`Не удалось отправить администратору напоминание о конфиге ${config.id}`, error);
+        }
       }
 
       for (const { telegramId, items } of remindersByUser.values()) {

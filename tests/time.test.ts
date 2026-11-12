@@ -5,6 +5,7 @@ import {
   dateAfterYears,
   daysUntilExpiry,
   expiryFromDate,
+  extendedExpiryDate,
   hiddenAtFromExpiry,
   isRevocationDue,
 } from "../src/time.js";
@@ -14,6 +15,18 @@ describe("правила срока действия", () => {
     const now = DateTime.fromISO("2026-01-31T12:00:00", { zone: "Europe/Moscow" });
     expect(dateAfterMonths(6, "Europe/Moscow", now)).toBe("2026-07-31");
     expect(dateAfterYears(1, "Europe/Moscow", now)).toBe("2027-01-31");
+  });
+
+  it("прибавляет срок к окончанию действующего конфига", () => {
+    const now = DateTime.fromISO("2026-07-20T12:00:00", { zone: "Europe/Moscow" });
+    const expiry = expiryFromDate("2026-07-30", "Europe/Moscow")!;
+    expect(extendedExpiryDate(expiry, { days: 30 }, "Europe/Moscow", now)).toBe("2026-08-29");
+  });
+
+  it("прибавляет срок к сегодняшнему дню для истёкшего конфига", () => {
+    const now = DateTime.fromISO("2026-07-20T12:00:00", { zone: "Europe/Moscow" });
+    const expiry = expiryFromDate("2026-07-19", "Europe/Moscow")!;
+    expect(extendedExpiryDate(expiry, { days: 30 }, "Europe/Moscow", now)).toBe("2026-08-19");
   });
 
   it("считает выбранную дату до конца дня по Москве", () => {

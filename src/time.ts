@@ -25,6 +25,17 @@ export function dateAfterYears(years: number, timezone: string, now = DateTime.n
   return now.setZone(timezone).plus({ years }).toFormat("yyyy-MM-dd");
 }
 
+export function extendedExpiryDate(
+  expiresAt: string,
+  period: { days?: number; months?: number; years?: number },
+  timezone: string,
+  now = DateTime.now()
+): string {
+  const current = now.setZone(timezone);
+  const previous = DateTime.fromISO(expiresAt, { zone: "utc" }).setZone(timezone);
+  return (previous > current ? previous : current).plus(period).toFormat("yyyy-MM-dd");
+}
+
 export function daysUntilExpiry(expiresAt: string, timezone: string, now = DateTime.now()): number {
   const today = now.setZone(timezone).startOf("day");
   const expiryDay = DateTime.fromISO(expiresAt, { zone: "utc" }).setZone(timezone).startOf("day");

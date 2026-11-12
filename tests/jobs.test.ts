@@ -94,8 +94,13 @@ describe("напоминания об окончании", () => {
     await jobs.sendReminders(now);
     await jobs.sendReminders(now);
 
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    const [telegramId, text, options] = sendMessage.mock.calls[0]!;
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const adminCall = sendMessage.mock.calls.find(([id]) => id === appConfig.adminTelegramId)!;
+    expect(adminCall[1]).toContain("Иван (Telegram ID 200) осталось 3 дня");
+    expect(adminCall[2].reply_markup.inline_keyboard[0]![0]).toMatchObject({
+      callback_data: `ae|${first.id}`,
+    });
+    const [telegramId, text, options] = sendMessage.mock.calls.find(([id]) => id === user.telegramId)!;
     expect(telegramId).toBe(user.telegramId);
     expect(text).toContain("нескольких VPN-конфигов");
     expect(text).toContain("«Телефон» — через 3 дня");
@@ -104,6 +109,9 @@ describe("напоминания об окончании", () => {
       .toBe(appConfig.contactUrl);
     await expect(
       db.notificationWasSent(first.id, "expires_3", "2026-07-29")
+    ).resolves.toBe(true);
+    await expect(
+      db.notificationWasSent(first.id, "admin_expires_3", "2026-07-29")
     ).resolves.toBe(true);
     await expect(
       db.notificationWasSent(second.id, "expires_2", "2026-07-29")
