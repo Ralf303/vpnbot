@@ -610,35 +610,30 @@ export class AppDatabase {
     events: CompletedTrafficSession[]
   ): Promise<void> {
     if (events.length === 0) return;
-    const storedCount = await this.prisma.trafficEvent.count({
-      where: { serverKey },
+    const clientNames = [...new Set(events.map((event) => event.clientName))];
+    const mappings = await this.prisma.clientName.findMany({
+      where: { name: { in: clientNames } },
+      select: { name: true, configId: true },
     });
-    if (storedCount !== events.length) {
-      const clientNames = [...new Set(events.map((event) => event.clientName))];
-      const mappings = await this.prisma.clientName.findMany({
-        where: { name: { in: clientNames } },
-        select: { name: true, configId: true },
+    const configByClient = new Map(
+      mappings.map(({ name, configId }) => [name, configId])
+    );
+    const batchSize = 500;
+    for (let offset = 0; offset < events.length; offset += batchSize) {
+      const batch = events.slice(offset, offset + batchSize);
+      await this.prisma.trafficEvent.createMany({
+        data: batch.map((event) => ({
+          serverKey,
+          eventId: event.eventId,
+          configId: configByClient.get(event.clientName) ?? null,
+          clientName: event.clientName,
+          uploadBytes: BigInt(event.uploadBytes),
+          downloadBytes: BigInt(event.downloadBytes),
+          connectedAt: new Date(event.connectedAt * 1000),
+          disconnectedAt: new Date(event.disconnectedAt * 1000),
+        })),
+        skipDuplicates: true,
       });
-      const configByClient = new Map(
-        mappings.map(({ name, configId }) => [name, configId])
-      );
-      const batchSize = 500;
-      for (let offset = 0; offset < events.length; offset += batchSize) {
-        const batch = events.slice(offset, offset + batchSize);
-        await this.prisma.trafficEvent.createMany({
-          data: batch.map((event) => ({
-            serverKey,
-            eventId: event.eventId,
-            configId: configByClient.get(event.clientName) ?? null,
-            clientName: event.clientName,
-            uploadBytes: BigInt(event.uploadBytes),
-            downloadBytes: BigInt(event.downloadBytes),
-            connectedAt: new Date(event.connectedAt * 1000),
-            disconnectedAt: new Date(event.disconnectedAt * 1000),
-          })),
-          skipDuplicates: true,
-        });
-      }
     }
 
     await this.prisma.$executeRaw`

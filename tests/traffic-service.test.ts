@@ -25,6 +25,7 @@ const NEW_TARGET: VpnServerTarget = {
 class FakeTrafficGateway {
   snapshot: TrafficSnapshot = { active: [], completed: [] };
   activeCalls = 0;
+  acknowledged: string[][] = [];
 
   async trafficSessions(): Promise<TrafficSnapshot> {
     return this.snapshot;
@@ -33,6 +34,10 @@ class FakeTrafficGateway {
   async activeSessions(): Promise<TrafficSnapshot["active"]> {
     this.activeCalls += 1;
     return this.snapshot.active;
+  }
+
+  async acknowledgeTrafficEvents(_server: VpnServerTarget, ids: string[]): Promise<void> {
+    this.acknowledged.push(ids);
   }
 }
 
@@ -104,6 +109,7 @@ describe("TrafficService", () => {
           downloadBytes: 20,
         },
       ],
+      batchIds: ["abcdefghijkl_1000_1100_1234"],
     };
 
     await service.syncAll();
@@ -123,6 +129,10 @@ describe("TrafficService", () => {
       liveAvailable: true,
     });
     expect(await db.prisma.trafficEvent.count()).toBe(1);
+    expect(gateway.acknowledged).toEqual([
+      ["abcdefghijkl_1000_1100_1234"],
+      ["abcdefghijkl_1000_1100_1234"],
+    ]);
   });
 
   it("показывает общую статистику серверов", async () => {
@@ -163,6 +173,7 @@ describe("TrafficService", () => {
   it("показывает активные подключения даже при ошибке импорта истории", async () => {
     gateway.snapshot = {
       completed: [trafficEvent("failed_import", config.clientName, 1000)],
+      batchIds: ["failed_import"],
       active: [
         {
           clientName: config.clientName,
@@ -180,6 +191,7 @@ describe("TrafficService", () => {
 
     expect(totals.servers.new!.liveAvailable).toBe(true);
     expect(totals.servers.new!.activeConnections).toBe(1);
+    expect(gateway.acknowledged).toEqual([]);
     log.mockRestore();
   });
 
@@ -220,6 +232,12 @@ describe("TrafficService", () => {
     await db.importTrafficEvents("new", events);
 
     expect(await db.prisma.trafficEvent.count()).toBe(events.length);
+  });
+
+  it("не пропускает новую порцию, если её размер равен числу уже учтённых событий", async () => {
+    await db.importTrafficEvents("new", [trafficEvent("first", config.clientName, 1000)]);
+    await db.importTrafficEvents("new", [trafficEvent("second", config.clientName, 2000)]);
+    expect(await db.prisma.trafficEvent.count()).toBe(2);
   });
 
   it("привязывает ранее импортированный трафик после появления конфига", async () => {

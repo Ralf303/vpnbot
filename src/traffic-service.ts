@@ -37,20 +37,22 @@ export class TrafficService {
     private readonly servers: ServerResolver
   ) {}
 
-  async syncAll(): Promise<void> {
+  async syncAll(): Promise<number> {
     const targets = await this.servers.usableTargets();
-    await Promise.all(
+    const processed = await Promise.all(
       targets.map(async (target) => {
         try {
-          await this.snapshot(target);
+          return await this.snapshot(target);
         } catch (error) {
           console.error(
             `Не удалось синхронизировать трафик сервера ${target.key}`,
             error
           );
+          return 0;
         }
       })
     );
+    return processed.reduce((total, count) => total + count, 0);
   }
 
   async forConfig(config: VpnConfigRecord): Promise<ConfigTrafficUsage> {
@@ -187,17 +189,20 @@ export class TrafficService {
     return { total: usage(total), servers };
   }
 
-  private async snapshot(target: VpnServerTarget): Promise<TrafficSnapshot> {
+  private async snapshot(target: VpnServerTarget): Promise<number> {
     const snapshot = await this.vpn.trafficSessions(target);
     try {
       await this.db.importTrafficEvents(target.key, snapshot.completed);
+      if (snapshot.batchIds?.length)
+        await this.vpn.acknowledgeTrafficEvents(target, snapshot.batchIds);
+      return snapshot.batchIds?.length ?? 0;
     } catch (error) {
       console.error(
         `Не удалось импортировать историю трафика сервера ${target.key}`,
         error
       );
+      return 0;
     }
-    return snapshot;
   }
 }
 

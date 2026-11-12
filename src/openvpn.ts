@@ -9,6 +9,7 @@ import type { VpnServerConfig } from "./config.js";
 import { runSshCommand } from "./ssh-run.js";
 
 const CLIENT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const TRAFFIC_CLIENT_NAME = /^[A-Za-z0-9_.@-]{1,64}$/;
 
 function verifyClientName(name: string): void {
   if (!CLIENT_NAME.test(name))
@@ -94,7 +95,31 @@ export class OpenVpnGateway {
 
   async trafficSessions(server: VpnServerTarget): Promise<TrafficSnapshot> {
     const output = await this.execute(server, ["traffic-sessions"]);
-    return parseTrafficSnapshot(output);
+    const snapshot = parseTrafficSnapshot(output);
+    const batchIds = output.toString("utf8").split(/\r?\n/)
+      .filter((line) => line.startsWith("batch\t"))
+      .map((line) => line.slice(6));
+    if (batchIds.length !== snapshot.completed.length ||
+        batchIds.some((id, index) => snapshot.completed[index]?.eventId !== id))
+      throw new Error("Некорректная порция событий трафика; файлы сохранены для проверки");
+    return { ...snapshot, batchIds };
+  }
+
+  async acknowledgeTrafficEvents(server: VpnServerTarget, eventIds: string[]): Promise<void> {
+    if (eventIds.length === 0) return;
+    if (eventIds.length > 1000 || eventIds.some((id) => !/^[A-Za-z0-9_.@-]{1,160}$/.test(id)))
+      throw new Error("Некорректные ID событий трафика");
+    await runSshCommand({
+      host: server.host,
+      port: server.port,
+      username: server.username,
+      privateKey: server.privateKey,
+      hostFingerprint: server.hostFingerprint,
+      command: `${server.helperCommand} traffic-ack`,
+      input: Buffer.from(`${eventIds.join("\n")}\n`),
+      proxyUrl: server.proxyUrl,
+      timeoutMs: 30_000,
+    });
   }
 
   async activeSessions(server: VpnServerTarget): Promise<ActiveTrafficSession[]> {
@@ -146,7 +171,7 @@ function parseTrafficSnapshot(output: Buffer): TrafficSnapshot {
     const fields = line.split("\t");
     if (fields[0] === "active" && fields.length === 5) {
       const [, clientName, connectedAt, uploadBytes, downloadBytes] = fields;
-      if (!clientName || !CLIENT_NAME.test(clientName)) continue;
+      if (!clientName || !TRAFFIC_CLIENT_NAME.test(clientName)) continue;
       const parsed = parseTrafficNumbers(
         connectedAt,
         uploadBytes,
@@ -168,7 +193,7 @@ function parseTrafficSnapshot(output: Buffer): TrafficSnapshot {
         !eventId ||
         eventId.length > 160 ||
         !clientName ||
-        !CLIENT_NAME.test(clientName)
+        !TRAFFIC_CLIENT_NAME.test(clientName)
       )
         continue;
       const parsed = parseTrafficNumbers(

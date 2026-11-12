@@ -7,6 +7,7 @@ EASYRSA_DIR="$OPENVPN_DIR/easy-rsa"
 PKI_DIR="$EASYRSA_DIR/pki"
 CLIENT_COMMON="$OPENVPN_DIR/client-common.txt"
 LOCK_FILE="/run/lock/openvpn-bot-helper.lock"
+TRAFFIC_LOCK_FILE="/run/lock/openvpn-bot-traffic.lock"
 VPN_SUBNET="10.8.0.0/24"
 TRAFFIC_EVENTS_DIR="/var/lib/openvpn-bot/traffic-events"
 
@@ -145,19 +146,25 @@ case "$command" in
     cleanup_managed_server "$@"
     exit 0
     ;;
-  list|stats|traffic-sessions|active-sessions)
+  list|stats|traffic-sessions|traffic-ack|active-sessions)
     ;;
   create|download|revoke)
     validate_client "${2:-}"
     ;;
   *)
-    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions, active-sessions, cleanup"
+    die "Допустимые команды: create, download, revoke, list, stats, traffic-sessions, traffic-ack, active-sessions, cleanup"
     ;;
 esac
 
 validate_installation
-exec 9>"$LOCK_FILE"
-flock -w 30 9 || die "Сервер занят другой операцией"
+if [[ "$command" == create || "$command" == download || "$command" == revoke || "$command" == list ]]; then
+  exec 9>"$LOCK_FILE"
+  flock -w 30 9 || die "Сервер занят другой операцией"
+fi
+if [[ "$command" == traffic-sessions || "$command" == traffic-ack ]]; then
+  exec 8>"$TRAFFIC_LOCK_FILE"
+  flock -w 30 8 || die "Учёт трафика занят другой операцией"
+fi
 
 case "$command" in
   create)
@@ -199,11 +206,32 @@ case "$command" in
     ;;
   traffic-sessions)
     if [[ -d "$TRAFFIC_EVENTS_DIR" ]]; then
-      find "$TRAFFIC_EVENTS_DIR" -maxdepth 1 -type f -name '*.tsv' -print0 \
-        | sort -z \
-        | xargs -0 -r cat
+      # Read a bounded batch. The bot acknowledges files only after the DB
+      # insert succeeds; a repeated batch is safe because event IDs are unique.
+      mapfile -d '' -t event_files < <(
+        find "$TRAFFIC_EVENTS_DIR" -maxdepth 1 -type f -name '*.tsv' -print0 \
+          | head -z -n 1000
+      )
+      for event_file in "${event_files[@]}"; do
+        event_id="${event_file##*/}"
+        event_id="${event_id%.tsv}"
+        IFS= read -r event_line < "$event_file" || die "Не удалось прочитать событие трафика"
+        printf 'batch\t%s\n' "$event_id"
+        printf '%s\n' "$event_line"
+      done
     fi
     print_active_sessions
+    ;;
+  traffic-ack)
+    event_paths=()
+    while IFS= read -r event_id; do
+      [[ "$event_id" =~ ^[A-Za-z0-9_.@-]{1,160}$ ]] || die "Некорректный ID события"
+      event_paths+=("$TRAFFIC_EVENTS_DIR/$event_id.tsv")
+      (( ${#event_paths[@]} <= 1000 )) || die "Слишком большая порция событий"
+    done
+    if (( ${#event_paths[@]} > 0 )); then
+      rm -f -- "${event_paths[@]}"
+    fi
     ;;
   active-sessions)
     print_active_sessions

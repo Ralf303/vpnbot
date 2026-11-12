@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -95,6 +95,10 @@ describe.skipIf(process.platform === "win32")("openvpn-bot-helper", () => {
         'TRAFFIC_EVENTS_DIR="/var/lib/openvpn-bot/traffic-events"',
         `TRAFFIC_EVENTS_DIR="${join(fixtureRoot, "traffic-events")}"`
       )
+      .replace(
+        'TRAFFIC_LOCK_FILE="/run/lock/openvpn-bot-traffic.lock"',
+        `TRAFFIC_LOCK_FILE="${join(fixtureRoot, "traffic.lock")}"`
+      )
       .replaceAll("/run/openvpn-server/", `${statusDir}/`)
       .replaceAll("/run/openvpn/status", `${fixtureRoot}/missing-run-status`)
       .replaceAll("/var/log/openvpn/status", `${fixtureRoot}/missing-var-status`);
@@ -111,5 +115,30 @@ describe.skipIf(process.platform === "win32")("openvpn-bot-helper", () => {
 
     const { stdout } = await execFileAsync("bash", [helperPath, "active-sessions"]);
     expect(stdout.trim()).toBe("active\ttestclient\t1700000000\t123\t456");
+
+    const eventDir = join(fixtureRoot, "traffic-events");
+    await mkdir(eventDir);
+    for (let index = 0; index < 1001; index++) {
+      const id = `client_${index}_1700000100_42`;
+      await writeFile(join(eventDir, `${id}.tsv`),
+        `completed\t${id}\tclient\t1700000000\t1700000100\t1\t2\n`);
+    }
+    const batch = (await execFileAsync("bash", [helperPath, "traffic-sessions"], {
+      maxBuffer: 1024 * 1024,
+    })).stdout;
+    const ids = batch.split("\n").filter((line) => line.startsWith("batch\t"))
+      .map((line) => line.slice(6));
+    expect(ids).toHaveLength(1000);
+    expect(batch).toContain("active\ttestclient\t1700000000\t123\t456");
+    expect(await readFile(join(eventDir, `${ids[0]}.tsv`), "utf8")).toContain("completed");
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("bash", [helperPath, "traffic-ack"]);
+      child.on("error", reject);
+      child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`ack exit ${code}`)));
+      child.stdin.end(`${ids.join("\n")}\n`);
+    });
+    await expect(access(join(eventDir, `${ids[0]}.tsv`))).rejects.toThrow();
+    const remaining = (await execFileAsync("bash", [helperPath, "traffic-sessions"])).stdout;
+    expect(remaining.split("\n").filter((line) => line.startsWith("batch\t"))).toHaveLength(1);
   });
 });

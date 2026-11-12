@@ -15,6 +15,7 @@ export class BackgroundJobs {
   private revocationsRunning = false;
   private delayedRevocationsRunning = false;
   private trafficRunning = false;
+  private stopping = false;
 
   constructor(
     private readonly bot: Bot,
@@ -26,6 +27,7 @@ export class BackgroundJobs {
   ) {}
 
   start(): void {
+    this.stopping = false;
     this.tasks.push(
       cron.schedule(
         `0 ${this.config.reminderHour} * * *`,
@@ -55,6 +57,7 @@ export class BackgroundJobs {
   }
 
   stop(): void {
+    this.stopping = true;
     for (const task of this.tasks) task.stop();
   }
 
@@ -185,7 +188,12 @@ export class BackgroundJobs {
     if (this.trafficRunning) return;
     this.trafficRunning = true;
     try {
-      await this.traffic.syncAll();
+      let processed: number;
+      do {
+        processed = await this.traffic.syncAll();
+        if (processed > 0 && !this.stopping)
+          await new Promise((resolve) => setTimeout(resolve, 500));
+      } while (processed > 0 && !this.stopping);
     } finally {
       this.trafficRunning = false;
     }

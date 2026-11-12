@@ -72,6 +72,7 @@ export interface CompletedTrafficSession extends ActiveTrafficSession {
 export interface TrafficSnapshot {
   active: ActiveTrafficSession[];
   completed: CompletedTrafficSession[];
+  batchIds?: string[];
 }
 
 export interface TrafficUsage extends ServerTraffic {
