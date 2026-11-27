@@ -315,7 +315,7 @@ clientmethod: none
 user.privileged: root
 user.unprivileged: nobody
 client pass { from: LOCAL/32 to: 0.0.0.0/0 }
-socks pass { from: LOCAL/32 to: 0.0.0.0/0 command: connect protocol: tcp }
+socks pass { from: LOCAL/32 to: 0.0.0.0/0 }
 DANTE
 sed -i "s/EXTERNAL/$external/" /etc/danted.conf
 mkdir -p /etc/systemd/system/danted.service.d
